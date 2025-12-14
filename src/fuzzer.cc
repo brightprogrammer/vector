@@ -29,6 +29,7 @@ struct ThreadStats {
     u32 unique_traces{0};
     std::string status{"Stopped"};
     std::string error_message{""};
+    FuzzInput current_input;  // Current input being tested by this thread
     
     void Update(u32 execs, u32 crs, u32 traces, const std::string& st, const std::string& err = "") {
         std::lock_guard<std::mutex> lock(mutex);
@@ -37,6 +38,16 @@ struct ThreadStats {
         unique_traces = traces;
         status = st;
         error_message = err;
+    }
+    
+    void UpdateInput(const FuzzInput& input) {
+        std::lock_guard<std::mutex> lock(mutex);
+        current_input = input;
+    }
+    
+    FuzzInput GetInput() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return current_input;
     }
     
     void Get(u32& execs, u32& crs, u32& traces, std::string& st, std::string& err) {
@@ -230,6 +241,9 @@ FuzzerThread::FuzzerThread(FuzzerKnowledge& k, u32 tid, ThreadStats& s)
     shared_trace = shared_trace_attach(shm_name.c_str());
     // Note: If attach fails, shared_trace will be nullptr, which ExecOnce will handle
     
+    // Copy stdout redirect path from settings (for use in child process)
+    stdout_redirect_path = knowledge.settings.stdout_redirect;
+    
     // Calculate thread-specific input size
     // Formula: clamp(min_length + step_size * thread_id, min_length, max_length)
     u32 min_len = knowledge.settings.input_size.min;
@@ -348,6 +362,35 @@ std::pair<FuzzExecution, std::pair<bool, int>> FuzzerThread::ExecOnce(const Fuzz
             _exit(1);
         }
         close(pipe_fds[0]);
+        
+        // Redirect stdout and stderr to the specified file
+        // Use O_APPEND for file redirection to allow multiple threads to write safely
+        // For /dev/null, O_WRONLY is sufficient
+        int redirect_fd;
+        if (stdout_redirect_path == "/dev/null") {
+            redirect_fd = open("/dev/null", O_WRONLY);
+        } else {
+            redirect_fd = open(stdout_redirect_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        }
+        
+        if (redirect_fd == -1) {
+            // If opening fails, try /dev/null as fallback
+            redirect_fd = open("/dev/null", O_WRONLY);
+            if (redirect_fd == -1) {
+                _exit(1);
+            }
+        }
+        
+        // Redirect stdout and stderr to the file
+        if (dup2(redirect_fd, STDOUT_FILENO) == -1) {
+            close(redirect_fd);
+            _exit(1);
+        }
+        if (dup2(redirect_fd, STDERR_FILENO) == -1) {
+            close(redirect_fd);
+            _exit(1);
+        }
+        close(redirect_fd);  // Close the original fd after dup2
         
         // Execute drrun directly (no shell wrapper)
         execvp(drrun_argv[0], const_cast<char* const*>(drrun_argv.data()));
@@ -546,12 +589,37 @@ void FuzzerThread::InitializationRun() {
         // Add execution to knowledge only if trace is non-empty
         // (AddExecutionIfDifferent enforces non-empty trace/input invariant)
         // Skip empty traces (e.g., from very early crashes before any basic blocks executed)
+        bool was_added = false;
         if (!execution.trace.empty()) {
-            knowledge.AddExecutionIfDifferent(execution);
+            was_added = knowledge.AddExecutionIfDifferent(execution);
         }
         // Update global execution counter even if we skip empty traces
         extern std::atomic<u32> g_total_executions;
         g_total_executions++;
+        
+        // Update thread stats: get current values, increment execution count
+        u32 current_execs, current_crashes, current_traces;
+        std::string current_status, current_err;
+        thread_stats.Get(current_execs, current_crashes, current_traces, current_status, current_err);
+        
+        // Increment execution count
+        current_execs++;
+        
+        // If crashed, increment crash count
+        if (crashed) {
+            current_crashes++;
+        }
+        
+        // If execution was added (new trace), increment unique traces count
+        if (was_added) {
+            current_traces++;
+        }
+        
+        // Update thread stats with all the incremented values
+        thread_stats.Update(current_execs, current_crashes, current_traces, current_status);
+        
+        // Update thread stats with current input
+        thread_stats.UpdateInput(input);
     }
 }
 
@@ -608,6 +676,9 @@ void FuzzerThread::Run() {
         current_execution.input = current_input;
     }
     
+    // Update thread stats with initial input (after resizing)
+    thread_stats.UpdateInput(current_input);
+    
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<u8> byte_dis(0, 255);
@@ -621,6 +692,7 @@ void FuzzerThread::Run() {
         if (g_should_stop_fuzzing.load()) {
             break;
         }
+        
         // Pick a forbidden execution from history (randomly)
         // Thread-safe: use snapshot
         history_snapshot = knowledge.GetHistorySnapshot();
@@ -688,6 +760,67 @@ void FuzzerThread::Run() {
             }
         }
         
+        // Add random mutations to 10% of input bytes to prevent getting stuck
+        // Prefer mutating bytes with high exploration_speed over low ones
+        if (current_input.size() > 0 && exploration_speed.size() == current_input.size()) {
+            u32 num_bytes_to_mutate = std::max((u32)1, (u32)(current_input.size() * 0.10));
+            std::unordered_set<u32> mutated_indices;
+            
+            // Create a weighted distribution based on exploration_speed
+            // Bytes with higher exploration_speed are more likely to be selected
+            std::vector<double> weights;
+            weights.reserve(current_input.size());
+            for (u32 i = 0; i < current_input.size(); ++i) {
+                // Use exploration_speed as weight, but ensure it's positive
+                // Negative values (frozen bytes) get very low weight
+                double weight = std::max(0.01, exploration_speed[i]);
+                weights.push_back(weight);
+            }
+            
+            // Create discrete distribution based on weights
+            std::discrete_distribution<u32> weighted_dis(weights.begin(), weights.end());
+            
+            for (u32 i = 0; i < num_bytes_to_mutate; ++i) {
+                u32 idx;
+                // Try to find an unmutated index (with retry limit to avoid infinite loop)
+                u32 retries = 0;
+                do {
+                    idx = weighted_dis(gen);
+                    retries++;
+                    if (retries > 100) {
+                        // Fallback: use uniform distribution if too many retries
+                        std::uniform_int_distribution<u32> fallback_dis(0, current_input.size() - 1);
+                        idx = fallback_dis(gen);
+                        break;
+                    }
+                } while (mutated_indices.count(idx) > 0);
+                mutated_indices.insert(idx);
+                
+                // Mutate this byte to a random value
+                current_input[idx] = byte_dis(gen);
+            }
+        } else if (current_input.size() > 0) {
+            // Fallback: if exploration_speed doesn't match, use uniform random selection
+            u32 num_bytes_to_mutate = std::max((u32)1, (u32)(current_input.size() * 0.10));
+            std::uniform_int_distribution<u32> index_dis(0, current_input.size() - 1);
+            std::unordered_set<u32> mutated_indices;
+            
+            for (u32 i = 0; i < num_bytes_to_mutate; ++i) {
+                u32 idx;
+                do {
+                    idx = index_dis(gen);
+                } while (mutated_indices.count(idx) > 0);
+                mutated_indices.insert(idx);
+                
+                // Mutate this byte to a random value
+                current_input[idx] = byte_dis(gen);
+            }
+        }
+        
+        // Update thread stats with the newly generated input (before execution)
+        // This ensures TUI shows what we're about to test, updating more frequently
+        thread_stats.UpdateInput(current_input);
+        
         // Ensure exploration speed matches thread-specific size
         if (exploration_speed.size() != thread_input_size) {
             InitializeExplorationSpeed(thread_input_size);
@@ -698,6 +831,14 @@ void FuzzerThread::Run() {
         FuzzExecution new_execution = exec_result.first;
         bool crashed = exec_result.second.first;
         int signal_number = exec_result.second.second;
+        
+        // Update current_input to match what was actually executed
+        // (ExecOnce sets execution.input = input, so they should match, but be explicit)
+        current_input = new_execution.input;
+        
+        // Update thread stats again with the executed input (after execution)
+        // This ensures TUI shows what was actually executed
+        thread_stats.UpdateInput(current_input);
         
         // If crashed, serialize crash information
         if (crashed) {
@@ -757,16 +898,97 @@ void FuzzerThread::Run() {
         extern std::atomic<u32> g_total_executions;
         g_total_executions++;
         
-        // If execution was added (new trace), freeze bytes that changed
+        // Update thread stats: get current values, increment execution count
+        u32 current_execs, current_crashes, current_traces;
+        std::string current_status, current_err;
+        thread_stats.Get(current_execs, current_crashes, current_traces, current_status, current_err);
+        
+        // Increment execution count
+        current_execs++;
+        
+        // If crashed, increment crash count
+        if (crashed) {
+            current_crashes++;
+        }
+        
+        // If execution was added (new trace), increment unique traces count
         if (was_added) {
             FreezeBytesForNewTrace(current_execution.input, new_execution.input);
+            current_traces++;
         }
+        
+        // Update thread stats with all the incremented values
+        thread_stats.Update(current_execs, current_crashes, current_traces, current_status);
         
         // Accelerate exploration speed (gradually unfreeze bytes)
         AccelerateExplorationSpeed();
         
-        // Update current execution for next iteration
-        current_execution = new_execution;
+        // Check if all bytes have exploration_speed >= 1.0 (stuck condition)
+        bool all_bytes_at_max = true;
+        for (const double& speed : exploration_speed) {
+            if (speed < 1.0) {
+                all_bytes_at_max = false;
+                break;
+            }
+        }
+        
+        if (all_bytes_at_max) {
+            stuck_execution_count++;
+            
+            // If stuck for 1000 executions, restart from a new historical input
+            if (stuck_execution_count >= 1000) {
+                // Pick a random historical execution as new base
+                history_snapshot = knowledge.GetHistorySnapshot();
+                std::uniform_int_distribution<u32> history_dis(0, knowledge.settings.max_history_count - 1);
+                u32 new_base_idx = history_dis(gen);
+                const FuzzExecution* new_base_execution = nullptr;
+                
+                // Find a valid execution in history
+                for (u32 i = 0; i < knowledge.settings.max_history_count; ++i) {
+                    u32 idx = (new_base_idx + i) % knowledge.settings.max_history_count;
+                    const auto& exec = history_snapshot[idx];
+                    if (!exec.trace.empty()) {
+                        new_base_execution = &exec;
+                        break;
+                    }
+                }
+                
+                if (new_base_execution) {
+                    // Reset to new base execution
+                    current_execution = *new_base_execution;
+                    current_input = new_base_execution->input;
+                    
+                    // Resize to thread-specific size if needed
+                    if (current_input.size() != thread_input_size) {
+                        current_input.resize(thread_input_size);
+                        if (current_input.size() > new_base_execution->input.size()) {
+                            for (u32 i = new_base_execution->input.size(); i < current_input.size(); ++i) {
+                                current_input[i] = byte_dis(gen);
+                            }
+                        }
+                        current_execution.input = current_input;
+                    }
+                    
+                    // Reset exploration speed to default (restart gradient descent)
+                    InitializeExplorationSpeed(thread_input_size, 0.01);
+                    
+                    // Reset stuck counter
+                    stuck_execution_count = 0;
+                }
+            }
+        } else {
+            // Not stuck, reset counter
+            stuck_execution_count = 0;
+        }
+        
+        // Update current execution for next iteration (use newly generated input as base)
+        // This happens unless we just restarted from historical input above
+        if (!all_bytes_at_max || stuck_execution_count < 1000) {
+            current_execution = new_execution;
+        }
+        
+        // current_input was already updated right after execution above
+        // No need to update again here
     }
 }
 

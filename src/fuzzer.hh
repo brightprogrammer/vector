@@ -28,6 +28,7 @@ struct FuzzerThread {
     std::string shm_name;  // Shared memory name (generated once in constructor)
     std::vector<std::string> drrun_argv_strings;  // Store strings for drrun arguments
     std::vector<const char*> drrun_argv;  // Command arguments for drrun (pointers to drrun_argv_strings)
+    std::string stdout_redirect_path;  // Path to redirect target program stdout/stderr (copied from settings)
     ThreadStats& thread_stats;  // Thread-safe stats for UI updates
     
     // Exploration speed for each input byte position
@@ -41,6 +42,10 @@ struct FuzzerThread {
     // Thread-specific input size
     // Calculated as: clamp(min_length + step_size * thread_id, min_length, max_length)
     u32 thread_input_size;
+    
+    // Counter for consecutive executions with all exploration_speed >= 1.0
+    // When this reaches 1000, we restart from a new historical input
+    u32 stuck_execution_count{0};
     
     // Constructor: attaches to shared memory for this thread
     // stats: thread-safe stats structure for UI updates

@@ -23,6 +23,13 @@ struct Settings {
     
     // Output directory for storing checkpoints, crashes, etc.
     std::string work_dir;             // Working directory for fuzzer output (default: "./fuzzer_output")
+    
+    // Redirect target program stdout/stderr to this file
+    // Use "/dev/null" to suppress all output, or a file path to capture it
+    std::string stdout_redirect;      // Where to redirect target program stdout/stderr (default: "/dev/null")
+    
+    // UI update frequency in milliseconds
+    u32 ui_update_freq;                // How often to update the TUI (default: 100ms)
 
     // Constructor that parses command line arguments
     Settings(int argc, char* argv[]);

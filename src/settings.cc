@@ -17,6 +17,8 @@ Settings::Settings(int argc, char* argv[]) {
     tracer_lib = "./build/libtracer.so";
     drrun_path = "./thirdparty/dynamorio/bin64/drrun";
     work_dir = "./fuzzer_output";
+    stdout_redirect = "/dev/null";
+        ui_update_freq = 50;  // Default: 50ms update frequency (more responsive)
   
     // Init command line parser
     CLI::App app{"Vector : An experimental directional fuzzing framework"};
@@ -33,6 +35,12 @@ Settings::Settings(int argc, char* argv[]) {
     
     // Output directory
     app.add_option("--work-dir", work_dir, "Directory for storing checkpoints, crashes, etc. (default=./fuzzer_output)");
+    
+    // Target program output redirection
+    app.add_option("--stdout-redirect", stdout_redirect, "Redirect target program stdout/stderr to this file (default=/dev/null)");
+    
+    // UI update frequency
+    app.add_option("--ui-update-freq", ui_update_freq, "TUI update frequency in milliseconds (default=100)");
        
     try {
         app.parse(argc, argv);
