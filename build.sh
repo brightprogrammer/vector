@@ -1,4 +1,5 @@
 #!/bin/sh
+set -e  # Abort on any command failure
 
 echo "Vector : An experimental directional fuzzing frawework"
 echo "With <3 by Siddharth Mishra"
@@ -16,18 +17,21 @@ rm -rf $BUILDDIR
 mkdir -pv $BUILDDIR
 
 echo "building tracer..."
-$CC -shared -fPIC $SRCDIR/tracer.c $SRCDIR/shared_trace.c -o$BUILDDIR/libtracer.so \
+if ! $CC -shared -fPIC $SRCDIR/tracer.c $SRCDIR/shared_trace.c -o$BUILDDIR/libtracer.so \
     -I$DEPSDIR/dynamorio/include \
     -I$DEPSDIR/dynamorio/ext/include \
     -L$DEPSDIR/dynamorio/lib64 \
     -L$DEPSDIR/dynamorio/ext/lib64 \
     -L$DEPSDIR/dynamorio/ext/lib64/release \
     -ldl -lm -ldrcontainers \
-    -DLINUX -DX86_64
+    -DLINUX -DX86_64; then
+    echo "ERROR: Failed to build tracer" >&2
+    exit 1
+fi
 echo "building tracer... DONE"
 
 echo "building fuzzer..."
-$CXX -std=c++14 \
+if ! $CXX -std=c++14 \
   $SRCDIR/main.cc \
   $SRCDIR/fuzzer.cc \
   $SRCDIR/settings.cc \
@@ -38,17 +42,23 @@ $CXX -std=c++14 \
   $SRCDIR/shared_trace.c \
   -o$BUILDDIR/main \
   -I$SRCDIR \
-  -I$DEPSDIR/finalcut/install/include \
   -I$DEPSDIR/CLI11 \
-  -L$DEPSDIR/finalcut/install/lib \
-  -Wl,-rpath,$DEPSDIR/finalcut/install/lib \
-  -lfinal -lpthread \
-  -Wall -Werror
+  -lpthread \
+  -Wall -Werror; then
+    echo "ERROR: Failed to build fuzzer" >&2
+    exit 1
+fi
 echo "building fuzzer... DONE"
 
 echo "building test programs..."
-mkdir -pv $BUILDDIR/testprograms
-$CC -O0 -g -o$BUILDDIR/testprograms/vulnerable \
+if ! mkdir -pv $BUILDDIR/testprograms; then
+    echo "ERROR: Failed to create testprograms directory" >&2
+    exit 1
+fi
+if ! $CC -O0 -g -o$BUILDDIR/testprograms/vulnerable \
     $ROOTDIR/testprograms/vulnerable.c \
-    -Wall -Wextra
+    -Wall -Wextra; then
+    echo "ERROR: Failed to build test programs" >&2
+    exit 1
+fi
 echo "building test programs... DONE"

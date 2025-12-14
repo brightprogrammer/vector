@@ -1,6 +1,3 @@
-// command line support
-#include <CLI11.hpp>
-
 // local includes
 #include "shared_trace.h"
 #include "types.hh"
@@ -10,378 +7,241 @@
 #include "knowledge.hh"
 #include "fuzzer.hh"
 
-// finalcut TUI support
-#include <final/final.h>
-namespace fc = finalcut;
-
 // stdc++
-#include <cmath>
-#include <vector>
-#include <unordered_map>
-#include <unordered_set>
-#include <algorithm>
-#include <random>
-#include <cstring>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <sstream>
+#include <iostream>
 #include <iomanip>
-
-using finalcut::FPoint;
-using finalcut::FSize;
-using finalcut::FColor;
-
-// Global state for UI updates
-struct FuzzerStats {
-    std::atomic<u32> total_executions{0};
-    std::atomic<u32> unique_traces{0};
-    std::atomic<u32> crashes{0};
-    std::atomic<u32> graph_nodes{0};
-    std::atomic<bool> should_stop{false};
-    std::mutex stats_mutex;
-};
-
-static FuzzerStats g_stats;
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <functional>
+#include <cstring>
+#include <chrono>
+#include <vector>
+#include <csignal>
+#include <memory>
+#include <mutex>
 
 // Global flag to stop fuzzing threads
 std::atomic<bool> g_should_stop_fuzzing{false};
 
+// Global execution counter (accessed from fuzzer.cc)
+std::atomic<u32> g_total_executions{0};
+
 // Global crash counter (accessed from fuzzer.cc)
 std::atomic<u32> g_crash_count{0};
 
-//----------------------------------------------------------------------
-// class FuzzerDialog
-//----------------------------------------------------------------------
+// Forward declaration
+struct ThreadStats;
 
-class FuzzerDialog final : public fc::FDialog
-{
-public:
-    // Constructor
-    explicit FuzzerDialog(fc::FWidget* parent, FuzzerKnowledge& knowledge);
-    
-    // Destructor
-    ~FuzzerDialog() override;
-    
-    // Update UI with current stats
-    void updateStats();
-    
-    // Set fuzzing state
-    void setFuzzing(bool running) { fuzzing = running; }
-    bool isFuzzing() const { return fuzzing; }
-
-private:
-    // Methods
-    void initLayout() override;
-    void adjustSize() override;
-    
-    // Event handlers
-    void onTimer(fc::FTimerEvent*) override;
-    void onClose(fc::FCloseEvent*) override;
-    
-    // Callback methods
-    void cb_start();
-    void cb_stop();
-    void cb_quit();
-    
-    // Data members
-    FuzzerKnowledge& knowledge;
-    bool fuzzing{false};
-    std::vector<std::thread> fuzzer_threads;
-    
-    // UI widgets
-    fc::FLabel title_label{this};
-    fc::FLabel stats_label{this};
-    fc::FLabel executions_label{this};
-    fc::FLabel traces_label{this};
-    fc::FLabel crashes_label{this};
-    fc::FLabel nodes_label{this};
-    fc::FLabel status_label{this};
-    fc::FButton start_btn{this};
-    fc::FButton stop_btn{this};
-    fc::FButton quit_btn{this};
-    
-    // Value labels
-    fc::FLabel executions_value{this};
-    fc::FLabel traces_value{this};
-    fc::FLabel crashes_value{this};
-    fc::FLabel nodes_value{this};
-    fc::FLabel status_value{this};
-};
-
-//----------------------------------------------------------------------
-FuzzerDialog::FuzzerDialog(fc::FWidget* parent, FuzzerKnowledge& k)
-    : fc::FDialog{parent}, knowledge(k)
-{
-    setText("Vector Fuzzer");
-    
-    // Configure labels
-    title_label.setText("Vector: Directional Fuzzing Framework");
-    title_label.setEmphasis();
-    
-    stats_label.setText("Statistics:");
-    stats_label.setEmphasis();
-    
-    executions_label.setText("Total Executions:");
-    traces_label.setText("Unique Traces:");
-    crashes_label.setText("Crashes Found:");
-    nodes_label.setText("Graph Nodes:");
-    status_label.setText("Status:");
-    
-    executions_value.setText("0");
-    traces_value.setText("0");
-    crashes_value.setText("0");
-    nodes_value.setText("0");
-    status_value.setText("Stopped");
-    
-    // Configure buttons
-    start_btn.setText("&Start");
-    start_btn.setStatusbarMessage("Start fuzzing");
-    
-    stop_btn.setText("S&top");
-    stop_btn.setStatusbarMessage("Stop fuzzing");
-    stop_btn.setDisable();
-    
-    quit_btn.setText("&Quit");
-    quit_btn.setStatusbarMessage("Exit application");
-    
-    // Connect callbacks
-    start_btn.addCallback("clicked", this, &FuzzerDialog::cb_start);
-    stop_btn.addCallback("clicked", this, &FuzzerDialog::cb_stop);
-    quit_btn.addCallback("clicked", this, &FuzzerDialog::cb_quit);
-}
-
-//----------------------------------------------------------------------
-FuzzerDialog::~FuzzerDialog()
-{
-    // Stop fuzzing if running
-    if (fuzzing) {
-        fuzzing = false;
-        // Wait for threads to finish
-        for (auto& t : fuzzer_threads) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
+// Simple hash function for ExecTrace (for display purposes)
+static u32 ComputeTraceHash(const ExecTrace& trace) {
+    u32 hash = 0;
+    for (u32 addr : trace) {
+        hash ^= addr;
+        hash = (hash << 1) | (hash >> 31);  // Rotate left
     }
-    delOwnTimers();
+    return hash;
 }
 
-//----------------------------------------------------------------------
-void FuzzerDialog::initLayout()
-{
-    FDialog::setGeometry(FPoint{5, 3}, FSize{70, 20});
-    
-    // Title
-    title_label.setGeometry(FPoint{2, 1}, FSize{66, 1});
-    
-    // Statistics section
-    stats_label.setGeometry(FPoint{2, 3}, FSize{20, 1});
-    executions_label.setGeometry(FPoint{4, 5}, FSize{20, 1});
-    executions_value.setGeometry(FPoint{25, 5}, FSize{10, 1});
-    traces_label.setGeometry(FPoint{4, 6}, FSize{20, 1});
-    traces_value.setGeometry(FPoint{25, 6}, FSize{10, 1});
-    crashes_label.setGeometry(FPoint{4, 7}, FSize{20, 1});
-    crashes_value.setGeometry(FPoint{25, 7}, FSize{10, 1});
-    nodes_label.setGeometry(FPoint{4, 8}, FSize{20, 1});
-    nodes_value.setGeometry(FPoint{25, 8}, FSize{10, 1});
-    status_label.setGeometry(FPoint{4, 10}, FSize{20, 1});
-    status_value.setGeometry(FPoint{25, 10}, FSize{20, 1});
-    
-    // Buttons
-    start_btn.setGeometry(FPoint{15, 15}, FSize{10, 1});
-    stop_btn.setGeometry(FPoint{28, 15}, FSize{10, 1});
-    quit_btn.setGeometry(FPoint{45, 15}, FSize{10, 1});
-    
-    FDialog::initLayout();
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::adjustSize()
-{
-    FDialog::adjustSize();
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::onTimer(fc::FTimerEvent*)
-{
-    updateStats();
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::onClose(fc::FCloseEvent* ev)
-{
-    if (fuzzing) {
-        // Ask for confirmation if fuzzing is running
-        fc::FMessageBox::error(this, "Please stop fuzzing before closing");
-        ev->ignore();
-        return;
+// Print summary when new execution is added
+static void PrintKnowledgeUpdate(const FuzzerKnowledge& knowledge, const FuzzExecution& execution) {
+    u32 trace_hash = ComputeTraceHash(execution.trace);
+    u32 graph_nodes = knowledge.graph.graph.size();
+    u32 graph_edges = 0;
+    for (const auto& entry : knowledge.graph.graph) {
+        graph_edges += entry.second.size();
     }
-    fc::FApplication::closeConfirmationDialog(this, ev);
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::updateStats()
-{
+    
     // Count unique traces in history
-    u32 unique_count = 0;
+    u32 unique_traces = 0;
     for (const auto& exec : knowledge.history) {
         if (!exec.trace.empty()) {
-            unique_count++;
+            unique_traces++;
         }
     }
     
-    // Update graph nodes count
-    u32 node_count = knowledge.graph.graph.size();
-    
-    // Update UI labels
-    executions_value.setText(std::to_string(g_stats.total_executions.load()));
-    traces_value.setText(std::to_string(unique_count));
-    crashes_value.setText(std::to_string(g_crash_count.load()));
-    nodes_value.setText(std::to_string(node_count));
-    
-    if (fuzzing) {
-        status_value.setText("Running");
-        status_value.setForegroundColor(FColor::Green);
-    } else {
-        status_value.setText("Stopped");
-        status_value.setForegroundColor(FColor::Red);
-    }
-    
-    // Redraw labels
-    executions_value.redraw();
-    traces_value.redraw();
-    crashes_value.redraw();
-    nodes_value.redraw();
-    status_value.redraw();
+    std::cout << "[+] New execution added:" << std::endl;
+    std::cout << "    Trace hash: 0x" << std::hex << std::setw(8) << std::setfill('0') << trace_hash << std::dec << std::endl;
+    std::cout << "    Trace length: " << execution.trace.size() << " basic blocks" << std::endl;
+    std::cout << "    Input size: " << execution.input.size() << " bytes" << std::endl;
+    std::cout << "    Graph nodes: " << graph_nodes << std::endl;
+    std::cout << "    Graph edges: " << graph_edges << std::endl;
+    std::cout << "    Unique traces: " << unique_traces << std::endl;
+    std::cout << "    Total executions: " << g_total_executions.load() << std::endl;
+    std::cout << "    Crashes found: " << g_crash_count.load() << std::endl;
+    std::cout << std::endl;
 }
 
-//----------------------------------------------------------------------
-void FuzzerDialog::cb_start()
-{
-    if (fuzzing) {
-        return;
+// Thread-safe stats structure (simplified for console output)
+struct ThreadStats {
+    std::mutex mutex;
+    u32 executions{0};
+    u32 crashes{0};
+    u32 unique_traces{0};
+    std::string status{"Stopped"};
+    std::string error_message{""};
+    
+    void Update(u32 execs, u32 crs, u32 traces, const std::string& st) {
+        std::lock_guard<std::mutex> lock(mutex);
+        executions = execs;
+        crashes = crs;
+        unique_traces = traces;
+        status = st;
     }
     
-    fuzzing = true;
-    g_should_stop_fuzzing = false; // Reset stop flag
-    start_btn.setDisable();
-    stop_btn.setEnable();
-    status_value.setText("Starting...");
-    status_value.redraw();
-    
-    // Start fuzzer threads
-    fuzzer_threads.clear();
-    for (u32 i = 0; i < knowledge.settings.thread_count; ++i) {
-        fuzzer_threads.emplace_back([this, i]() {
-            try {
-                FuzzerThread fuzzer(knowledge, i);
-                // Run initialization
-                fuzzer.InitializationRun();
-                g_stats.total_executions += 2; // Initialization adds 2 executions
-                
-                // Main fuzzing loop - Run() checks g_should_stop_fuzzing
-                fuzzer.Run();
-            } catch (const std::exception& e) {
-                // Thread error
-                fuzzing = false; // Stop all threads on error
-            }
-        });
+    void Get(u32& execs, u32& crs, u32& traces, std::string& st, std::string& err) {
+        std::lock_guard<std::mutex> lock(mutex);
+        execs = executions;
+        crs = crashes;
+        traces = unique_traces;
+        st = status;
+        err = error_message;
     }
-    
-    // Start update timer (update every 500ms)
-    addTimer(500);
-    
-    status_value.setText("Running");
-    status_value.setForegroundColor(FColor::Green);
-    status_value.redraw();
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::cb_stop()
-{
-    if (!fuzzing) {
-        return;
-    }
-    
-    fuzzing = false;
-    g_should_stop_fuzzing = true; // Signal threads to stop
-    stop_btn.setDisable();
-    start_btn.setEnable();
-    
-    // Wait for threads to finish (with timeout)
-    for (auto& t : fuzzer_threads) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
-    fuzzer_threads.clear();
-    
-    delOwnTimers();
-    
-    status_value.setText("Stopped");
-    status_value.setForegroundColor(FColor::Red);
-    status_value.redraw();
-}
-
-//----------------------------------------------------------------------
-void FuzzerDialog::cb_quit()
-{
-    if (fuzzing) {
-        cb_stop();
-    }
-    close();
-}
-
-//----------------------------------------------------------------------
-//                               main part
-//----------------------------------------------------------------------
+};
 
 int main(int argc, char* argv[])
 {
     try {
         Settings settings(argc, argv);
         
+        std::cout << "Vector: Directional Fuzzing Framework" << std::endl;
+        std::cout << "=====================================" << std::endl;
+        std::cout << "Target: " << settings.target_program << std::endl;
+        std::cout << "Threads: " << settings.thread_count << std::endl;
+        std::cout << "Work directory: " << settings.work_dir << std::endl;
+        std::cout << std::endl;
+        
         // Try to load existing knowledge checkpoint
         FuzzerKnowledge* knowledge_ptr = nullptr;
         std::string checkpoint_path = settings.work_dir + "/knowledge_checkpoint.knowledge";
         
         try {
-            FuzzerKnowledge loaded_knowledge = DeserializeKnowledge(checkpoint_path);
+            // DeserializeKnowledge uses output parameter to avoid copying mutexes
+            FuzzerKnowledge loaded_knowledge(settings);
+            DeserializeKnowledge(checkpoint_path, loaded_knowledge);
             // Use loaded knowledge if settings match
             if (loaded_knowledge.settings.target_program == settings.target_program) {
-                // Update settings to match current command line
-                loaded_knowledge.settings = settings;
-                knowledge_ptr = new FuzzerKnowledge(loaded_knowledge.settings);
-                *knowledge_ptr = loaded_knowledge;
+                // Create new knowledge with current settings
+                knowledge_ptr = new FuzzerKnowledge(settings);
+                // Manually copy history and graph (mutexes will be newly initialized)
+                knowledge_ptr->history = loaded_knowledge.history;
+                knowledge_ptr->history_index = loaded_knowledge.history_index;
+                knowledge_ptr->graph.CopyGraphData(loaded_knowledge.graph);
+                std::cout << "[*] Loaded existing knowledge checkpoint" << std::endl;
+                std::cout << "    Unique traces: " << loaded_knowledge.history.size() << std::endl;
+                std::cout << std::endl;
             } else {
                 // Settings don't match, create new
                 knowledge_ptr = new FuzzerKnowledge(settings);
+                std::cout << "[*] Created new knowledge (settings mismatch)" << std::endl;
             }
         } catch (...) {
             // No checkpoint found or error loading, create new
             knowledge_ptr = new FuzzerKnowledge(settings);
+            std::cout << "[*] Created new knowledge" << std::endl;
         }
         
         FuzzerKnowledge& knowledge = *knowledge_ptr;
         
-        // Create the application object
-        fc::FApplication app{argc, argv};
+        // Hook into AddExecutionIfDifferent to print updates
+        // We'll modify knowledge.cc to call a callback, or we can check periodically
+        // For now, let's add a wrapper or modify the approach
         
-        // Create fuzzer dialog
-        FuzzerDialog dialog{&app, knowledge};
+        // Initialize thread stats
+        std::vector<std::unique_ptr<ThreadStats>> thread_stats;
+        thread_stats.reserve(settings.thread_count);
+        for (u32 i = 0; i < settings.thread_count; ++i) {
+            thread_stats.push_back(std::make_unique<ThreadStats>());
+        }
         
-        // Set dialog as main widget
-        fc::FWidget::setMainWidget(&dialog);
+        // Reset stop flag
+        g_should_stop_fuzzing = false;
         
-        // Show and start the application
-        dialog.show();
-        int result = app.exec();
+        // Set up signal handler for graceful shutdown
+        std::signal(SIGINT, [](int) {
+            std::cout << std::endl << "[*] Received SIGINT, stopping fuzzer..." << std::endl;
+            g_should_stop_fuzzing = true;
+        });
+        std::signal(SIGTERM, [](int) {
+            std::cout << std::endl << "[*] Received SIGTERM, stopping fuzzer..." << std::endl;
+            g_should_stop_fuzzing = true;
+        });
+        
+        std::cout << "[*] Starting fuzzer threads..." << std::endl;
+        std::cout << std::endl;
+        
+        // Spawn fuzzer threads
+        std::vector<std::thread> fuzzer_threads;
+        for (u32 i = 0; i < settings.thread_count; ++i) {
+            fuzzer_threads.emplace_back([&knowledge, i, &thread_stats]() {
+                auto& stats = *thread_stats[i];
+                u32 local_executions = 0;
+                u32 local_crashes = 0;
+                u32 local_unique_traces = 0;
+                
+                try {
+                    stats.Update(local_executions, local_crashes, local_unique_traces, "Initializing");
+                    
+                    FuzzerThread fuzzer(knowledge, i, stats);
+                    
+                    // Run initialization
+                    fuzzer.InitializationRun();
+                    local_executions += 2;
+                    stats.Update(local_executions, local_crashes, local_unique_traces, "Running");
+                    
+                    // Main fuzzing loop - Run() checks g_should_stop_fuzzing
+                    fuzzer.Run();
+                    
+                    stats.Update(local_executions, local_crashes, local_unique_traces, "Stopped");
+                } catch (const std::exception& e) {
+                    std::cerr << "[!] Thread " << i << " error: " << e.what() << std::endl;
+                    stats.Update(local_executions, local_crashes, local_unique_traces, "Error");
+                } catch (...) {
+                    std::cerr << "[!] Thread " << i << " unknown error" << std::endl;
+                    stats.Update(local_executions, local_crashes, local_unique_traces, "Error");
+                }
+            });
+        }
+        
+        // Monitor knowledge updates and print summaries
+        u32 last_history_size = 0;
+        while (!g_should_stop_fuzzing.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            // Check if new executions were added
+            // Thread-safe: use snapshot
+            std::vector<FuzzExecution> history_snapshot = knowledge.GetHistorySnapshot();
+            u32 current_history_size = 0;
+            u32 latest_idx = 0;
+            for (u32 i = 0; i < history_snapshot.size(); ++i) {
+                if (!history_snapshot[i].trace.empty()) {
+                    current_history_size++;
+                    latest_idx = i;
+                }
+            }
+            
+            if (current_history_size > last_history_size) {
+                // New execution added - print summary
+                const FuzzExecution& latest = history_snapshot[latest_idx];
+                PrintKnowledgeUpdate(knowledge, latest);
+                last_history_size = current_history_size;
+            }
+        }
+        
+        // Wait for threads to finish
+        std::cout << "[*] Stopping fuzzer threads..." << std::endl;
+        for (auto& t : fuzzer_threads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        
+        std::cout << "[*] Fuzzing complete" << std::endl;
         
         // Cleanup
         delete knowledge_ptr;
         
-        return result;
+        return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

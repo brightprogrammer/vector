@@ -15,7 +15,7 @@ Settings::Settings(int argc, char* argv[]) {
     thread_count = 1;
     max_history_count = 100;
     tracer_lib = "./build/libtracer.so";
-    drrun_path = "drrun";
+    drrun_path = "./thirdparty/dynamorio/bin64/drrun";
     work_dir = "./fuzzer_output";
   
     // Init command line parser

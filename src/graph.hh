@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <random>
+#include <mutex>
 
 ///
 /// Graph module maintains a graph structure from execution traces.
@@ -30,6 +31,7 @@ struct ExploredGraph {
     std::unordered_map<u32, Embedding> embeddings;          // node embeddings
     u32 embedding_dim;                                      // embedding dimension
     std::mt19937 rng;                                       // random generator
+    mutable std::mutex graph_mutex;                          // Protects graph and embeddings access
 
     // Node2Vec parameters
     double p;                                               // return parameter (BFS bias)
@@ -63,7 +65,9 @@ struct ExploredGraph {
     Embedding MeanEmbedding(const ExecTrace& trace) const;
 
     // Get embedding for a specific node (returns empty embedding if node doesn't exist)
+    // Thread-safe: uses internal mutex
     Embedding GetNodeEmbedding(u32 node) const {
+        std::lock_guard<std::mutex> lock(graph_mutex);
         if (embeddings.count(node)) {
             return embeddings.at(node);
         }
@@ -85,6 +89,10 @@ struct ExploredGraph {
     // Zero embedding (origin in embedding space)
     // Initialized in constructor with instance's embedding_dim
     Embedding ZERO_EMBEDDING;
+    
+    // Copy graph data (without mutex) - for serialization/crash info
+    // Thread-safe: locks both this and other's mutexes
+    void CopyGraphData(const ExploredGraph& other);
 
 private:
     // Generate a biased random walk starting from a node

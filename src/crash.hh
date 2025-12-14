@@ -45,10 +45,10 @@ void SerializeCrash(const CrashInfo& crash_info, const std::string& filepath);
 /// Deserialize crash information from a file
 ///
 /// @param filepath Path to the file containing serialized crash data
-/// @return CrashInfo structure containing the deserialized data
+/// @param crash_info Output parameter - will be populated with deserialized data
 /// @throws std::runtime_error if file operations fail or data is corrupted
 ///
-CrashInfo DeserializeCrash(const std::string& filepath);
+void DeserializeCrash(const std::string& filepath, CrashInfo& crash_info);
 
 ///
 /// Check if a process exit status indicates a crash

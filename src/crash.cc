@@ -201,13 +201,11 @@ void SerializeCrash(const CrashInfo& crash_info, const std::string& filepath) {
     }
 }
 
-CrashInfo DeserializeCrash(const std::string& filepath) {
+void DeserializeCrash(const std::string& filepath, CrashInfo& crash_info) {
     std::ifstream in(filepath, std::ios::binary);
     if (!in.is_open()) {
         throw std::runtime_error("DeserializeCrash: failed to open file for reading: " + filepath);
     }
-    
-    CrashInfo crash_info;
     
     // Read endianness
     bool is_little_endian;
@@ -331,8 +329,6 @@ CrashInfo DeserializeCrash(const std::string& filepath) {
     if (in.fail()) {
         throw std::runtime_error("DeserializeCrash: failed to read all data from file");
     }
-    
-    return crash_info;
 }
 
 bool IsCrashStatus(int status) {

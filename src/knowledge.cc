@@ -24,6 +24,9 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
         throw std::logic_error("Cannot add execution with empty input to knowledge");
     }
 
+    // Thread-safe: lock mutex for entire operation
+    std::lock_guard<std::mutex> lock(knowledge_mutex);
+
     // Check if trace is different from all existing traces in history
     // Runtime invariant: all entries in history have non-empty traces and inputs
     for (u32 i = 0; i < history.size(); ++i) {
@@ -46,6 +49,11 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
     // Trace is different, add to circular buffer
     history[history_index] = execution;
     history_index = (history_index + 1) % settings.max_history_count;
+    
+    // Update graph with the new trace (adds nodes and edges)
+    graph.UpdateGraphFromTrace(execution.trace);
+    // Update embeddings after adding new nodes/edges
+    graph.UpdateEmbeddings();
 
     // Automatically serialize knowledge to checkpoint file if filepath is set
     if (!checkpoint_filepath.empty()) {
@@ -56,8 +64,21 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
             // Just continue - checkpoint is best-effort
         }
     }
+    
+    // Notify that a new execution was added (for main.cc to print summary)
+    // This is done by returning true, and main.cc will detect the change
 
     return true;
+}
+
+std::vector<FuzzExecution> FuzzerKnowledge::GetHistorySnapshot() const {
+    std::lock_guard<std::mutex> lock(knowledge_mutex);
+    return history;
+}
+
+u32 FuzzerKnowledge::GetHistoryIndex() const {
+    std::lock_guard<std::mutex> lock(knowledge_mutex);
+    return history_index;
 }
 
 void FuzzerKnowledge::SetCheckpointFilepath(const std::string& filepath) {
@@ -278,7 +299,7 @@ void SerializeKnowledge(const FuzzerKnowledge& knowledge, const std::string& fil
     }
 }
 
-FuzzerKnowledge DeserializeKnowledge(const std::string& filepath) {
+void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledge) {
     std::ifstream in(filepath, std::ios::binary);
     if (!in.is_open()) {
         throw std::runtime_error("DeserializeKnowledge: failed to open file for reading: " + filepath);
@@ -328,8 +349,14 @@ FuzzerKnowledge DeserializeKnowledge(const std::string& filepath) {
     settings.drrun_path = ReadString(in);
     settings.work_dir = ReadString(in);
     
-    // Create FuzzerKnowledge with deserialized settings
-    FuzzerKnowledge knowledge(settings);
+    // Reconstruct knowledge with deserialized settings
+    // We can't assign because of mutex, so we need to manually set members
+    // First, create a new knowledge object and copy data
+    FuzzerKnowledge temp_knowledge(settings);
+    knowledge.history = temp_knowledge.history;
+    knowledge.history_index = temp_knowledge.history_index;
+    knowledge.settings = settings;
+    knowledge.graph.CopyGraphData(temp_knowledge.graph);
     
     // Read history_index
     in.read(reinterpret_cast<char*>(&knowledge.history_index), sizeof(u32));
@@ -425,6 +452,4 @@ FuzzerKnowledge DeserializeKnowledge(const std::string& filepath) {
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read all data from file");
     }
-    
-    return knowledge;
 }

@@ -5,6 +5,7 @@
 #include "graph.hh"
 #include "settings.hh"
 #include <vector>
+#include <mutex>
 
 ///
 /// FuzzerKnowledge holds the accumulated knowledge from fuzzing sessions.
@@ -15,6 +16,7 @@ struct FuzzerKnowledge {
     u32 history_index;                   // Current write index in circular buffer
     Settings settings;
     ExploredGraph graph;
+    mutable std::mutex knowledge_mutex;  // Protects history, history_index, and graph access
 
     // Constructor
     FuzzerKnowledge(const Settings& s);
@@ -22,10 +24,17 @@ struct FuzzerKnowledge {
     // Add execution to knowledge only if trace is different from existing ones
     // Returns true if execution was added, false if it was a duplicate
     // Automatically serializes knowledge to checkpoint file when execution is added
+    // Thread-safe: uses internal mutex
     bool AddExecutionIfDifferent(const FuzzExecution& execution);
     
     // Set checkpoint filepath for automatic serialization
     void SetCheckpointFilepath(const std::string& filepath);
+    
+    // Thread-safe accessor to get a copy of history for reading
+    std::vector<FuzzExecution> GetHistorySnapshot() const;
+    
+    // Thread-safe accessor to get current history index
+    u32 GetHistoryIndex() const;
     
 private:
     std::string checkpoint_filepath;  // Filepath for automatic checkpoint serialization
@@ -44,10 +53,10 @@ void SerializeKnowledge(const FuzzerKnowledge& knowledge, const std::string& fil
 /// Deserialize FuzzerKnowledge from a file
 ///
 /// @param filepath Path to the file containing serialized knowledge
-/// @return FuzzerKnowledge structure containing the deserialized data
+/// @param knowledge Output parameter - will be populated with deserialized data
 /// @throws std::runtime_error if file operations fail or data is corrupted
 ///
-FuzzerKnowledge DeserializeKnowledge(const std::string& filepath);
+void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledge);
 
 #endif // VECTOR_FUZZER_KNOWLEDGE_HH
 

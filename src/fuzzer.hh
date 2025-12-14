@@ -8,6 +8,9 @@
 #include <vector>
 #include <string>
 
+// Forward declaration
+struct ThreadStats;
+
 ///
 /// Represents the Jacobian matrix retrieved after computation of gradient
 /// of execution traces (outputs) with respect to inputs
@@ -25,6 +28,7 @@ struct FuzzerThread {
     std::string shm_name;  // Shared memory name (generated once in constructor)
     std::vector<std::string> drrun_argv_strings;  // Store strings for drrun arguments
     std::vector<const char*> drrun_argv;  // Command arguments for drrun (pointers to drrun_argv_strings)
+    ThreadStats& thread_stats;  // Thread-safe stats for UI updates
     
     // Exploration speed for each input byte position
     // Values range from -1.0 to 1.0
@@ -34,8 +38,13 @@ struct FuzzerThread {
     // - Gradually increases with acceleration 0.001 to allow mutation again
     std::vector<double> exploration_speed;
     
+    // Thread-specific input size
+    // Calculated as: clamp(min_length + step_size * thread_id, min_length, max_length)
+    u32 thread_input_size;
+    
     // Constructor: attaches to shared memory for this thread
-    FuzzerThread(FuzzerKnowledge& k, u32 tid);
+    // stats: thread-safe stats structure for UI updates
+    FuzzerThread(FuzzerKnowledge& k, u32 tid, ThreadStats& stats);
     
     // Destructor: detaches from shared memory
     ~FuzzerThread();

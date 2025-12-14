@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <unordered_set>
 #include <stdexcept>
+#include <mutex>
 
 // Update graph with a new trace (walk)
 // Adds new nodes and edges as encountered in the trace
 // Automatically initializes embeddings for new nodes
+// Thread-safe: uses internal mutex
 void ExploredGraph::UpdateGraphFromTrace(const ExecTrace& trace) {
+    std::lock_guard<std::mutex> lock(graph_mutex);
+    
     for (u32 i = 0; i < trace.size(); ++i) {
         u32 node = trace[i];
         
@@ -284,5 +288,22 @@ double ExploredGraph::GetNodeDistance(u32 node1, u32 node2) const {
 double ExploredGraph::GetNodeDistanceWithOrigin(u32 node) const {
     Embedding emb = GetNodeEmbedding(node);
     return EmbeddingDistance(emb, ZERO_EMBEDDING);
+}
+
+// Copy graph data (without mutex) - for serialization/crash info
+void ExploredGraph::CopyGraphData(const ExploredGraph& other) {
+    std::lock_guard<std::mutex> lock_this(graph_mutex);
+    std::lock_guard<std::mutex> lock_other(other.graph_mutex);
+    graph = other.graph;
+    embeddings = other.embeddings;
+    embedding_dim = other.embedding_dim;
+    p = other.p;
+    q = other.q;
+    walk_length = other.walk_length;
+    num_walks = other.num_walks;
+    window_size = other.window_size;
+    learning_rate = other.learning_rate;
+    ZERO_EMBEDDING = other.ZERO_EMBEDDING;
+    // Note: rng is not copied (new instance will have its own)
 }
 
