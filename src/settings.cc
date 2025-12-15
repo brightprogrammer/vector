@@ -18,7 +18,8 @@ Settings::Settings(int argc, char* argv[]) {
     drrun_path = "./thirdparty/dynamorio/bin64/drrun";
     work_dir = "./fuzzer_output";
     stdout_redirect = "/dev/null";
-        ui_update_freq = 50;  // Default: 50ms update frequency (more responsive)
+    ui_update_freq = 50;  // Default: 50ms update frequency (more responsive)
+    seed_path = "";  // Default: no seed directory
   
     // Init command line parser
     CLI::App app{"Vector : An experimental directional fuzzing framework"};
@@ -41,6 +42,9 @@ Settings::Settings(int argc, char* argv[]) {
     
     // UI update frequency
     app.add_option("--ui-update-freq", ui_update_freq, "TUI update frequency in milliseconds (default=100)");
+    
+    // Seed directory
+    app.add_option("--seed-path", seed_path, "Path to directory containing seed inputs to load into history");
        
     try {
         app.parse(argc, argv);

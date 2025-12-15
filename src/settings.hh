@@ -30,6 +30,9 @@ struct Settings {
     
     // UI update frequency in milliseconds
     u32 ui_update_freq;                // How often to update the TUI (default: 100ms)
+    
+    // Seed directory path (optional)
+    std::string seed_path;             // Path to directory containing seed inputs (default: empty, no seeds)
 
     // Constructor that parses command line arguments
     Settings(int argc, char* argv[]);

@@ -21,44 +21,6 @@
 #include <atomic>
 #include <mutex>
 
-// Forward declaration from main.cc
-struct ThreadStats {
-    std::mutex mutex;
-    u32 executions{0};
-    u32 crashes{0};
-    u32 unique_traces{0};
-    std::string status{"Stopped"};
-    std::string error_message{""};
-    FuzzInput current_input;  // Current input being tested by this thread
-    
-    void Update(u32 execs, u32 crs, u32 traces, const std::string& st, const std::string& err = "") {
-        std::lock_guard<std::mutex> lock(mutex);
-        executions = execs;
-        crashes = crs;
-        unique_traces = traces;
-        status = st;
-        error_message = err;
-    }
-    
-    void UpdateInput(const FuzzInput& input) {
-        std::lock_guard<std::mutex> lock(mutex);
-        current_input = input;
-    }
-    
-    FuzzInput GetInput() {
-        std::lock_guard<std::mutex> lock(mutex);
-        return current_input;
-    }
-    
-    void Get(u32& execs, u32& crs, u32& traces, std::string& st, std::string& err) {
-        std::lock_guard<std::mutex> lock(mutex);
-        execs = executions;
-        crs = crashes;
-        traces = unique_traces;
-        st = status;
-        err = error_message;
-    }
-};
 
 // Internal gradient computation functions (not exposed in header)
 namespace {
@@ -204,8 +166,8 @@ FuzzInput GenerateNewInputWithGradientDescent(FuzzerKnowledge& knowledge,
 ///
 /// Constructor: creates and attaches to shared memory for this thread
 ///
-FuzzerThread::FuzzerThread(FuzzerKnowledge& k, u32 tid, ThreadStats& s) 
-    : knowledge(k), thread_id(tid), shared_trace(nullptr), thread_stats(s) {
+FuzzerThread::FuzzerThread(FuzzerKnowledge& k, u32 tid) 
+    : knowledge(k), thread_id(tid), shared_trace(nullptr) {
     // Construct shared memory name for this thread (generate once)
     // Format: /topfuzz_trace_<thread_id>
     std::ostringstream shm_name_stream;
@@ -459,12 +421,20 @@ void FuzzerThread::InitializationRun() {
     // Keep running until we have at least 2 executions in knowledge
     while (true) {
         // Count executions in history (runtime invariant: all entries have non-empty traces/inputs)
-        // Thread-safe: use snapshot
-        std::vector<FuzzExecution> history_snapshot = knowledge.GetHistorySnapshot();
+        // Thread-safe: read directly with lock
         u32 execution_count = 0;
-        for (const auto& exec : history_snapshot) {
-            if (!exec.trace.empty()) {
-                execution_count++;
+        FuzzInput first_input;
+        u32 original_first_input_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(knowledge.knowledge_mutex);
+            for (const auto& exec : knowledge.history) {
+                if (!exec.trace.empty()) {
+                    execution_count++;
+                    if (execution_count == 1 && first_input.empty()) {
+                        first_input = exec.input;
+                        original_first_input_size = exec.input.size();
+                    }
+                }
             }
         }
         
@@ -486,17 +456,7 @@ void FuzzerThread::InitializationRun() {
             InitializeExplorationSpeed(input.size());
         } else {
             // We have 1 execution, generate second input by mutating the first
-            // Find the first execution in history (runtime invariant: it has non-empty trace/input)
-            // Thread-safe: use snapshot
-            FuzzInput first_input;
-            u32 original_first_input_size = 0;
-            for (const auto& exec : history_snapshot) {
-                if (!exec.trace.empty()) {
-                    first_input = exec.input;
-                    original_first_input_size = exec.input.size();
-                    break;
-                }
-            }
+            // Thread-safe: first_input was already copied above with lock held
             
             // Resize to thread-specific size if needed
             if (first_input.size() != thread_input_size) {
@@ -596,30 +556,6 @@ void FuzzerThread::InitializationRun() {
         // Update global execution counter even if we skip empty traces
         extern std::atomic<u32> g_total_executions;
         g_total_executions++;
-        
-        // Update thread stats: get current values, increment execution count
-        u32 current_execs, current_crashes, current_traces;
-        std::string current_status, current_err;
-        thread_stats.Get(current_execs, current_crashes, current_traces, current_status, current_err);
-        
-        // Increment execution count
-        current_execs++;
-        
-        // If crashed, increment crash count
-        if (crashed) {
-            current_crashes++;
-        }
-        
-        // If execution was added (new trace), increment unique traces count
-        if (was_added) {
-            current_traces++;
-        }
-        
-        // Update thread stats with all the incremented values
-        thread_stats.Update(current_execs, current_crashes, current_traces, current_status);
-        
-        // Update thread stats with current input
-        thread_stats.UpdateInput(input);
     }
 }
 
@@ -629,12 +565,14 @@ void FuzzerThread::InitializationRun() {
 void FuzzerThread::Run() {
     // First, ensure we have at least 2 executions in history
     // Count executions (runtime invariant: all stored entries have non-empty traces/inputs)
-    // Thread-safe: use snapshot
-    std::vector<FuzzExecution> history_snapshot = knowledge.GetHistorySnapshot();
+    // Thread-safe: read directly with lock
     u32 valid_executions = 0;
-    for (const auto& exec : history_snapshot) {
-        if (!exec.trace.empty()) {
-            valid_executions++;
+    {
+        std::lock_guard<std::mutex> lock(knowledge.knowledge_mutex);
+        for (const auto& exec : knowledge.history) {
+            if (!exec.trace.empty()) {
+                valid_executions++;
+            }
         }
     }
     
@@ -651,13 +589,16 @@ void FuzzerThread::Run() {
     
     // Get current execution from history (use the most recent one)
     // Runtime invariant: history always has non-empty traces and inputs
-    // Thread-safe: use snapshot and index
-    history_snapshot = knowledge.GetHistorySnapshot();
-    u32 history_idx = knowledge.GetHistoryIndex();
-    u32 latest_idx = (history_idx + knowledge.settings.max_history_count - 1) % knowledge.settings.max_history_count;
-    const FuzzExecution& latest_exec = history_snapshot[latest_idx];
-    FuzzExecution current_execution = latest_exec;
-    FuzzInput current_input = latest_exec.input;
+    // Thread-safe: read directly with lock
+    FuzzExecution current_execution;
+    FuzzInput current_input;
+    {
+        std::lock_guard<std::mutex> lock(knowledge.knowledge_mutex);
+        u32 history_idx = knowledge.history_index;
+        u32 latest_idx = (history_idx + knowledge.settings.max_history_count - 1) % knowledge.settings.max_history_count;
+        current_execution = knowledge.history[latest_idx];
+        current_input = current_execution.input;
+    }
     
     // Resize input to thread-specific size if needed
     // Each thread uses a different input size based on its thread_id
@@ -676,9 +617,6 @@ void FuzzerThread::Run() {
         current_execution.input = current_input;
     }
     
-    // Update thread stats with initial input (after resizing)
-    thread_stats.UpdateInput(current_input);
-    
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<u8> byte_dis(0, 255);
@@ -694,36 +632,41 @@ void FuzzerThread::Run() {
         }
         
         // Pick a forbidden execution from history (randomly)
-        // Thread-safe: use snapshot
-        history_snapshot = knowledge.GetHistorySnapshot();
-        std::uniform_int_distribution<u32> history_dis(0, knowledge.settings.max_history_count - 1);
-        u32 forbidden_idx = history_dis(gen);
-        const FuzzExecution* forbidden_execution = nullptr;
-        
-        // Find a valid execution in history (runtime invariant: all entries have non-empty traces/inputs)
-        for (u32 i = 0; i < knowledge.settings.max_history_count; ++i) {
-            u32 idx = (forbidden_idx + i) % knowledge.settings.max_history_count;
-            const auto& exec = history_snapshot[idx];
-            if (!exec.trace.empty()) {
-                forbidden_execution = &exec;
-                break;
+        // Thread-safe: read directly with lock and copy what we need
+        FuzzExecution forbidden_execution;
+        {
+            std::lock_guard<std::mutex> lock(knowledge.knowledge_mutex);
+            std::uniform_int_distribution<u32> history_dis(0, knowledge.settings.max_history_count - 1);
+            u32 forbidden_idx = history_dis(gen);
+            
+            // Find a valid execution in history (runtime invariant: all entries have non-empty traces/inputs)
+            bool found = false;
+            for (u32 i = 0; i < knowledge.settings.max_history_count; ++i) {
+                u32 idx = (forbidden_idx + i) % knowledge.settings.max_history_count;
+                const auto& exec = knowledge.history[idx];
+                if (!exec.trace.empty()) {
+                    forbidden_execution = exec;
+                    found = true;
+                    break;
+                }
             }
-        }
-        
-        // Generate new input using gradient descent
-        // Runtime invariant: forbidden_execution should always be found (we have at least 2 executions)
-        if (!forbidden_execution) {
-            throw std::logic_error("Run: no forbidden execution found in history (invariant violation)");
+            
+            // Generate new input using gradient descent
+            // Runtime invariant: forbidden_execution should always be found (we have at least 2 executions)
+            if (!found) {
+                throw std::logic_error("Run: no forbidden execution found in history (invariant violation)");
+            }
         }
         
         // Create copies of executions with thread-specific input sizes
         // This ensures all inputs match thread_input_size for gradient computation
-        FuzzExecution forbidden_exec_resized = *forbidden_execution;
+        FuzzExecution forbidden_exec_resized = forbidden_execution;
         if (forbidden_exec_resized.input.size() != thread_input_size) {
+            u32 original_size = forbidden_exec_resized.input.size();
             forbidden_exec_resized.input.resize(thread_input_size);
             // Fill with random bytes if expanding
-            if (forbidden_exec_resized.input.size() > forbidden_execution->input.size()) {
-                for (u32 i = forbidden_execution->input.size(); i < forbidden_exec_resized.input.size(); ++i) {
+            if (forbidden_exec_resized.input.size() > original_size) {
+                for (u32 i = original_size; i < forbidden_exec_resized.input.size(); ++i) {
                     forbidden_exec_resized.input[i] = byte_dis(gen);
                 }
             }
@@ -817,10 +760,6 @@ void FuzzerThread::Run() {
             }
         }
         
-        // Update thread stats with the newly generated input (before execution)
-        // This ensures TUI shows what we're about to test, updating more frequently
-        thread_stats.UpdateInput(current_input);
-        
         // Ensure exploration speed matches thread-specific size
         if (exploration_speed.size() != thread_input_size) {
             InitializeExplorationSpeed(thread_input_size);
@@ -835,10 +774,6 @@ void FuzzerThread::Run() {
         // Update current_input to match what was actually executed
         // (ExecOnce sets execution.input = input, so they should match, but be explicit)
         current_input = new_execution.input;
-        
-        // Update thread stats again with the executed input (after execution)
-        // This ensures TUI shows what was actually executed
-        thread_stats.UpdateInput(current_input);
         
         // If crashed, serialize crash information
         if (crashed) {
@@ -898,27 +833,10 @@ void FuzzerThread::Run() {
         extern std::atomic<u32> g_total_executions;
         g_total_executions++;
         
-        // Update thread stats: get current values, increment execution count
-        u32 current_execs, current_crashes, current_traces;
-        std::string current_status, current_err;
-        thread_stats.Get(current_execs, current_crashes, current_traces, current_status, current_err);
-        
-        // Increment execution count
-        current_execs++;
-        
-        // If crashed, increment crash count
-        if (crashed) {
-            current_crashes++;
-        }
-        
-        // If execution was added (new trace), increment unique traces count
+        // If execution was added (new trace), freeze bytes that caused the new trace
         if (was_added) {
             FreezeBytesForNewTrace(current_execution.input, new_execution.input);
-            current_traces++;
         }
-        
-        // Update thread stats with all the incremented values
-        thread_stats.Update(current_execs, current_crashes, current_traces, current_status);
         
         // Accelerate exploration speed (gradually unfreeze bytes)
         AccelerateExplorationSpeed();
@@ -938,31 +856,37 @@ void FuzzerThread::Run() {
             // If stuck for 1000 executions, restart from a new historical input
             if (stuck_execution_count >= 1000) {
                 // Pick a random historical execution as new base
-                history_snapshot = knowledge.GetHistorySnapshot();
-                std::uniform_int_distribution<u32> history_dis(0, knowledge.settings.max_history_count - 1);
-                u32 new_base_idx = history_dis(gen);
-                const FuzzExecution* new_base_execution = nullptr;
-                
-                // Find a valid execution in history
-                for (u32 i = 0; i < knowledge.settings.max_history_count; ++i) {
-                    u32 idx = (new_base_idx + i) % knowledge.settings.max_history_count;
-                    const auto& exec = history_snapshot[idx];
-                    if (!exec.trace.empty()) {
-                        new_base_execution = &exec;
-                        break;
+                // Thread-safe: read directly with lock
+                FuzzExecution new_base_execution;
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lock(knowledge.knowledge_mutex);
+                    std::uniform_int_distribution<u32> history_dis(0, knowledge.settings.max_history_count - 1);
+                    u32 new_base_idx = history_dis(gen);
+                    
+                    // Find a valid execution in history
+                    for (u32 i = 0; i < knowledge.settings.max_history_count; ++i) {
+                        u32 idx = (new_base_idx + i) % knowledge.settings.max_history_count;
+                        const auto& exec = knowledge.history[idx];
+                        if (!exec.trace.empty()) {
+                            new_base_execution = exec;
+                            found = true;
+                            break;
+                        }
                     }
                 }
                 
-                if (new_base_execution) {
+                if (found) {
                     // Reset to new base execution
-                    current_execution = *new_base_execution;
-                    current_input = new_base_execution->input;
+                    current_execution = new_base_execution;
+                    current_input = new_base_execution.input;
                     
                     // Resize to thread-specific size if needed
                     if (current_input.size() != thread_input_size) {
+                        u32 original_size = current_input.size();
                         current_input.resize(thread_input_size);
-                        if (current_input.size() > new_base_execution->input.size()) {
-                            for (u32 i = new_base_execution->input.size(); i < current_input.size(); ++i) {
+                        if (current_input.size() > original_size) {
+                            for (u32 i = original_size; i < current_input.size(); ++i) {
                                 current_input[i] = byte_dis(gen);
                             }
                         }

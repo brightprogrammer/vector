@@ -28,9 +28,15 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
     std::lock_guard<std::mutex> lock(knowledge_mutex);
 
     // Check if trace is different from all existing traces in history
-    // Runtime invariant: all entries in history have non-empty traces and inputs
+    // Skip empty entries (circular buffer may have empty slots)
     for (u32 i = 0; i < history.size(); ++i) {
         const ExecTrace& existing_trace = history[i].trace;
+        
+        // Skip empty traces (circular buffer may have empty slots)
+        if (existing_trace.empty()) {
+            continue;
+        }
+        
         const ExecTrace& new_trace = execution.trace;
 
         // If sizes are different, traces are different
@@ -38,7 +44,7 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
             continue;  // Different size, check next
         }
 
-        // If sizes are same, compare data (both are non-empty by invariant)
+        // If sizes are same, compare data (both are non-empty)
         if (std::memcmp(existing_trace.data(), new_trace.data(),
                        existing_trace.size() * sizeof(u32)) == 0) {
             // Traces are identical, don't add
@@ -100,6 +106,7 @@ static void WriteString(std::ofstream& out, const std::string& str) {
 }
 
 // Helper function to read a string from file
+// Format: length (u32) followed by exactly 'length' bytes of data
 static std::string ReadString(std::ifstream& in) {
     u32 len;
     in.read(reinterpret_cast<char*>(&len), sizeof(u32));
@@ -107,10 +114,13 @@ static std::string ReadString(std::ifstream& in) {
         throw std::runtime_error("DeserializeKnowledge: failed to read string length");
     }
     
+    // Format specifies length - allocate exactly that much and read exactly that many bytes
     std::string str(len, '\0');
-    in.read(&str[0], len);
-    if (in.fail()) {
-        throw std::runtime_error("DeserializeKnowledge: failed to read string data");
+    if (len > 0) {
+        in.read(&str[0], len);
+        if (in.fail()) {
+            throw std::runtime_error("DeserializeKnowledge: failed to read string data");
+        }
     }
     return str;
 }
@@ -125,6 +135,7 @@ static void WriteU8Vector(std::ofstream& out, const std::vector<u8>& vec) {
 }
 
 // Helper function to read a vector of u8
+// Format: size (u32) followed by exactly 'size' bytes of data
 static std::vector<u8> ReadU8Vector(std::ifstream& in) {
     u32 size;
     in.read(reinterpret_cast<char*>(&size), sizeof(u32));
@@ -132,6 +143,7 @@ static std::vector<u8> ReadU8Vector(std::ifstream& in) {
         throw std::runtime_error("DeserializeKnowledge: failed to read u8 vector size");
     }
     
+    // Format specifies size - allocate exactly that much and read exactly that many bytes
     std::vector<u8> vec(size);
     if (size > 0) {
         in.read(reinterpret_cast<char*>(vec.data()), size * sizeof(u8));
@@ -152,6 +164,7 @@ static void WriteU32Vector(std::ofstream& out, const std::vector<u32>& vec) {
 }
 
 // Helper function to read a vector of u32
+// Format: size (u32) followed by exactly 'size' u32 values
 static std::vector<u32> ReadU32Vector(std::ifstream& in) {
     u32 size;
     in.read(reinterpret_cast<char*>(&size), sizeof(u32));
@@ -159,6 +172,7 @@ static std::vector<u32> ReadU32Vector(std::ifstream& in) {
         throw std::runtime_error("DeserializeKnowledge: failed to read u32 vector size");
     }
     
+    // Format specifies size - allocate exactly that much and read exactly that many u32s
     std::vector<u32> vec(size);
     if (size > 0) {
         in.read(reinterpret_cast<char*>(vec.data()), size * sizeof(u32));
@@ -194,6 +208,7 @@ static void WriteEmbedding(std::ofstream& out, const Embedding& emb) {
 }
 
 // Helper function to read an Embedding
+// Format: size (u32) followed by exactly 'size' double values
 static Embedding ReadEmbedding(std::ifstream& in) {
     u32 size;
     in.read(reinterpret_cast<char*>(&size), sizeof(u32));
@@ -201,6 +216,7 @@ static Embedding ReadEmbedding(std::ifstream& in) {
         throw std::runtime_error("DeserializeKnowledge: failed to read embedding size");
     }
     
+    // Format specifies size - allocate exactly that much and read exactly that many doubles
     Embedding emb(size);
     if (size > 0) {
         in.read(reinterpret_cast<char*>(emb.data()), size * sizeof(double));
@@ -349,20 +365,24 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
     settings.drrun_path = ReadString(in);
     settings.work_dir = ReadString(in);
     
-    // Reconstruct knowledge with deserialized settings
-    // We can't assign because of mutex, so we need to manually set members
-    // First, create a new knowledge object and copy data
-    FuzzerKnowledge temp_knowledge(settings);
-    knowledge.history = temp_knowledge.history;
-    knowledge.history_index = temp_knowledge.history_index;
+    // Update knowledge settings first
     knowledge.settings = settings;
-    knowledge.graph.CopyGraphData(temp_knowledge.graph);
+    
+    // Resize history to match deserialized max_history_count
+    knowledge.history.resize(settings.max_history_count);
     
     // Read history_index
-    in.read(reinterpret_cast<char*>(&knowledge.history_index), sizeof(u32));
+    u32 read_history_index;
+    in.read(reinterpret_cast<char*>(&read_history_index), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read history_index");
     }
+    
+    // Validate history_index is within bounds
+    if (read_history_index >= settings.max_history_count) {
+        throw std::runtime_error("DeserializeKnowledge: history_index out of bounds (possible corruption)");
+    }
+    knowledge.history_index = read_history_index;
     
     // Read history (circular buffer)
     u32 history_size;
@@ -370,7 +390,16 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read history size");
     }
-    knowledge.history.resize(history_size);
+    
+    // Validate history_size matches max_history_count (circular buffer should be full size)
+    if (history_size != settings.max_history_count) {
+        throw std::runtime_error("DeserializeKnowledge: history size mismatch (possible corruption)");
+    }
+    
+    // Ensure history is large enough
+    if (history_size > knowledge.history.size()) {
+        knowledge.history.resize(history_size);
+    }
     for (u32 i = 0; i < history_size; ++i) {
         knowledge.history[i] = ReadFuzzExecution(in);
     }
@@ -402,52 +431,76 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
     }
     double learning_rate = ReadDouble(in);
     
-    // Reconstruct graph with parameters
-    knowledge.graph.embedding_dim = embedding_dim;
-    knowledge.graph.p = p;
-    knowledge.graph.q = q;
-    knowledge.graph.walk_length = walk_length;
-    knowledge.graph.num_walks = num_walks;
-    knowledge.graph.window_size = window_size;
-    knowledge.graph.learning_rate = learning_rate;
-    
-    // Initialize RNG with a default seed (we can't serialize RNG state)
-    knowledge.graph.rng = std::mt19937(42);
+    // Set graph parameters BEFORE reading graph data
+    {
+        std::lock_guard<std::mutex> lock(knowledge.graph.graph_mutex);
+        knowledge.graph.embedding_dim = embedding_dim;
+        knowledge.graph.p = p;
+        knowledge.graph.q = q;
+        knowledge.graph.walk_length = walk_length;
+        knowledge.graph.num_walks = num_walks;
+        knowledge.graph.window_size = window_size;
+        knowledge.graph.learning_rate = learning_rate;
+        // Initialize RNG with a default seed (we can't serialize RNG state)
+        knowledge.graph.rng = std::mt19937(42);
+        // Initialize ZERO_EMBEDDING with correct dimension
+        knowledge.graph.ZERO_EMBEDDING = Embedding(embedding_dim, 0.0);
+    }
     
     // Read graph: graph structure (adjacency list)
+    // Format: num_nodes (u32) followed by num_nodes entries, each with node (u32) and neighbors (u32 vector)
     u32 num_nodes;
     in.read(reinterpret_cast<char*>(&num_nodes), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read number of nodes");
     }
-    for (u32 i = 0; i < num_nodes; ++i) {
-        u32 node;
-        in.read(reinterpret_cast<char*>(&node), sizeof(u32));
-        if (in.fail()) {
-            throw std::runtime_error("DeserializeKnowledge: failed to read node ID");
+    
+    {
+        std::lock_guard<std::mutex> lock(knowledge.graph.graph_mutex);
+        knowledge.graph.graph.clear();
+        for (u32 i = 0; i < num_nodes; ++i) {
+            u32 node;
+            in.read(reinterpret_cast<char*>(&node), sizeof(u32));
+            if (in.fail()) {
+                throw std::runtime_error("DeserializeKnowledge: failed to read node ID");
+            }
+            std::vector<u32> neighbors = ReadU32Vector(in);
+            knowledge.graph.graph[node] = neighbors;
         }
-        std::vector<u32> neighbors = ReadU32Vector(in);
-        knowledge.graph.graph[node] = neighbors;
     }
     
     // Read graph: embeddings
+    // Format: num_embeddings (u32) followed by num_embeddings entries, each with node (u32) and embedding (embedding)
     u32 num_embeddings;
     in.read(reinterpret_cast<char*>(&num_embeddings), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read number of embeddings");
     }
-    for (u32 i = 0; i < num_embeddings; ++i) {
-        u32 node;
-        in.read(reinterpret_cast<char*>(&node), sizeof(u32));
-        if (in.fail()) {
-            throw std::runtime_error("DeserializeKnowledge: failed to read embedding node ID");
-        }
-        Embedding emb = ReadEmbedding(in);
-        knowledge.graph.embeddings[node] = emb;
-    }
     
-    // Read ZERO_EMBEDDING
-    knowledge.graph.ZERO_EMBEDDING = ReadEmbedding(in);
+    {
+        std::lock_guard<std::mutex> lock(knowledge.graph.graph_mutex);
+        knowledge.graph.embeddings.clear();
+        for (u32 i = 0; i < num_embeddings; ++i) {
+            u32 node;
+            in.read(reinterpret_cast<char*>(&node), sizeof(u32));
+            if (in.fail()) {
+                throw std::runtime_error("DeserializeKnowledge: failed to read embedding node ID");
+            }
+            Embedding emb = ReadEmbedding(in);
+            // Validate embedding dimension matches (format consistency check)
+            if (emb.size() != embedding_dim) {
+                throw std::runtime_error("DeserializeKnowledge: embedding dimension mismatch (possible corruption)");
+            }
+            knowledge.graph.embeddings[node] = emb;
+        }
+        
+        // Read ZERO_EMBEDDING and validate dimension (format consistency check)
+        Embedding zero_emb = ReadEmbedding(in);
+        if (zero_emb.size() != embedding_dim) {
+            throw std::runtime_error("DeserializeKnowledge: ZERO_EMBEDDING dimension mismatch (possible corruption)");
+        }
+        knowledge.graph.ZERO_EMBEDDING = zero_emb;
+    }
     
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read all data from file");

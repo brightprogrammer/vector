@@ -40,6 +40,7 @@ if ! $CXX -std=c++14 \
   $SRCDIR/loss.cc \
   $SRCDIR/graph.cc \
   $SRCDIR/tui.cc \
+  $SRCDIR/seed.cc \
   $SRCDIR/shared_trace.c \
   -o$BUILDDIR/main \
   -I$SRCDIR \
