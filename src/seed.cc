@@ -224,37 +224,32 @@ u32 LoadSeedsFromDirectory(const std::string& seed_dir, FuzzerKnowledge& knowled
             continue;
         }
         
-        try {
-            // Execute program with seed input
-            auto exec_result = ExecuteWithInput(input, settings, shm_name);
-            FuzzExecution execution = exec_result.first;
-            bool crashed = exec_result.second.first;
-            int signal_number = exec_result.second.second;
-            
-            // Handle crashes (log but continue)
-            if (crashed) {
-                std::cerr << "[!] Seed file caused crash (signal " << signal_number 
-                          << "): " << filepath << std::endl;
-            }
-            
-            // Add to knowledge only if trace is non-empty
-            if (!execution.trace.empty()) {
-                bool was_added = knowledge.AddExecutionIfDifferent(execution);
-                if (was_added) {
-                    loaded_count++;
-                    std::cout << "[+] Loaded seed: " << filepath 
-                              << " (trace length: " << execution.trace.size() << ")" << std::endl;
-                } else {
-                    skipped_count++;
-                    std::cout << "[-] Skipped duplicate seed: " << filepath << std::endl;
-                }
+        // Execute program with seed input
+        auto exec_result = ExecuteWithInput(input, settings, shm_name);
+        FuzzExecution execution = exec_result.first;
+        bool crashed = exec_result.second.first;
+        int signal_number = exec_result.second.second;
+        
+        // Handle crashes (log but continue)
+        if (crashed) {
+            std::cerr << "[!] Seed file caused crash (signal " << signal_number 
+                      << "): " << filepath << std::endl;
+        }
+        
+        // Add to knowledge only if trace is non-empty
+        if (!execution.trace.empty()) {
+            bool was_added = knowledge.AddExecutionIfDifferent(execution);
+            if (was_added) {
+                loaded_count++;
+                std::cout << "[+] Loaded seed: " << filepath 
+                          << " (trace length: " << execution.trace.size() << ")" << std::endl;
             } else {
                 skipped_count++;
-                std::cout << "[-] Skipped seed with empty trace: " << filepath << std::endl;
+                std::cout << "[-] Skipped duplicate seed: " << filepath << std::endl;
             }
-        } catch (const std::exception& e) {
-            std::cerr << "[!] Error processing seed file " << filepath << ": " << e.what() << std::endl;
+        } else {
             skipped_count++;
+            std::cout << "[-] Skipped seed with empty trace: " << filepath << std::endl;
         }
     }
     

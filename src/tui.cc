@@ -3,6 +3,7 @@
 #include <final/final.h>
 #include <sstream>
 #include <iomanip>
+#include <exception>
 
 FuzzerTUI::FuzzerTUI(finalcut::FWidget* parent, FuzzerKnowledge& knowledge, const Settings& settings)
     : finalcut::FDialog{parent}, knowledge(knowledge), settings(settings) {
@@ -35,16 +36,22 @@ void FuzzerTUI::onShow(finalcut::FShowEvent* ev) {
 
 void FuzzerTUI::onClose(finalcut::FCloseEvent* ev) {
     is_running.store(false);
+    // Stop timer to prevent RefreshDisplay() from being called during destruction
+    delAllTimers();
     ev->accept();
 }
 
 void FuzzerTUI::onKeyPress(finalcut::FKeyEvent* ev) {
     if (ev->key() == finalcut::FKey::Escape) {
         is_running.store(false);
+        // Stop timer before closing
+        delAllTimers();
         close();
         ev->accept();
     } else if (ev->key() == finalcut::FKey('q') || ev->key() == finalcut::FKey('Q')) {
         is_running.store(false);
+        // Stop timer before closing
+        delAllTimers();
         close();
         ev->accept();
     } else {
@@ -54,11 +61,19 @@ void FuzzerTUI::onKeyPress(finalcut::FKeyEvent* ev) {
 
 void FuzzerTUI::onTimer(finalcut::FTimerEvent* ev) {
     // This is called from the main UI thread, so it's safe to update widgets
-    RefreshDisplay();
+    // Only refresh if we're still running
+    if (is_running.load()) {
+        RefreshDisplay();
+    }
     finalcut::FDialog::onTimer(ev);
 }
 
 void FuzzerTUI::RefreshDisplay() {
+    // Don't update if we're closing
+    if (!is_running.load()) {
+        return;
+    }
+    
     // Update geometry based on current terminal size
     finalcut::FSize term_size = getParentWidget()->getTermGeometry().getSize();
     setGeometry(finalcut::FPoint{1, 1}, finalcut::FSize{term_size.getWidth(), term_size.getHeight()});
@@ -129,6 +144,21 @@ void FuzzerTUI::RefreshDisplay() {
     latest_view->append(latest_oss.str());
     
     redraw();
+}
+
+FuzzerTUI::~FuzzerTUI() {
+    // Stop timer first to prevent any callbacks during destruction
+    delAllTimers();
+    
+    // Set running flag to false to prevent RefreshDisplay() from running
+    is_running.store(false);
+    
+    // Clear widget pointers - parent will handle actual deletion
+    // Don't delete them here as finalcut manages widget lifetime
+    stats_view = nullptr;
+    latest_view = nullptr;
+    
+    // Base class destructor will be called automatically
 }
 
 

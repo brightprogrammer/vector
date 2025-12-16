@@ -20,6 +20,9 @@
 #include <iomanip>
 #include <atomic>
 #include <mutex>
+#include <sys/wait.h>
+#include <signal.h>
+#include <thread>
 
 
 // Internal gradient computation functions (not exposed in header)
@@ -197,11 +200,15 @@ FuzzerThread::FuzzerThread(FuzzerKnowledge& k, u32 tid)
     int fd = shared_trace_create(shm_name.c_str());
     if (fd >= 0) {
         close(fd);  // Close the file descriptor, we'll attach separately
+    } else {
+        throw std::runtime_error("FuzzerThread constructor: failed to create shared memory: " + shm_name);
     }
     
     // Attach to shared memory (keep it attached for the lifetime of the thread)
     shared_trace = shared_trace_attach(shm_name.c_str());
-    // Note: If attach fails, shared_trace will be nullptr, which ExecOnce will handle
+    if (!shared_trace) {
+        throw std::runtime_error("FuzzerThread constructor: failed to attach to shared memory: " + shm_name);
+    }
     
     // Copy stdout redirect path from settings (for use in child process)
     stdout_redirect_path = knowledge.settings.stdout_redirect;
@@ -219,7 +226,7 @@ FuzzerThread::FuzzerThread(FuzzerKnowledge& k, u32 tid)
 ///
 /// Destructor: detaches from shared memory
 ///
-FuzzerThread::~FuzzerThread() {
+FuzzerThread::~FuzzerThread() noexcept {
     if (shared_trace) {
         shared_trace_detach(shared_trace);
         shared_trace = nullptr;
@@ -361,6 +368,9 @@ std::pair<FuzzExecution, std::pair<bool, int>> FuzzerThread::ExecOnce(const Fuzz
         // Parent process: write input to pipe, then wait for child
         close(pipe_fds[0]);  // Close read end
         
+        // Store child PID so it can be killed if we need to stop
+        current_child_pid.store(pid);
+        
         // Write input to pipe
         ssize_t written = write(pipe_fds[1], input.data(), input.size());
         close(pipe_fds[1]);  // Close write end (child will see EOF)
@@ -368,12 +378,38 @@ std::pair<FuzzExecution, std::pair<bool, int>> FuzzerThread::ExecOnce(const Fuzz
         if (written != (ssize_t)input.size()) {
             // Failed to write all input
             waitpid(pid, NULL, 0);  // Clean up child
+            current_child_pid.store(0);
             throw std::runtime_error("ExecOnce: failed to write all input to pipe");
         }
         
-        // Wait for child to complete
+        // Wait for child to complete, but check stop flag periodically
+        // Use WNOHANG to make waitpid non-blocking so we can check the flag
         int status;
-        waitpid(pid, &status, 0);
+        extern std::atomic<bool> g_should_stop_fuzzing;
+        while (true) {
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                // Child finished
+                break;
+            } else if (result == 0) {
+                // Child still running, check if we should stop
+                if (g_should_stop_fuzzing.load()) {
+                    // Kill the child process and exit immediately
+                    kill(pid, SIGKILL);
+                    waitpid(pid, NULL, 0);  // Clean up zombie
+                    current_child_pid.store(0);
+                    // Return empty execution to signal we're stopping
+                    execution.trace.clear();
+                    return std::make_pair(execution, std::make_pair(false, 0));
+                }
+                // Sleep briefly before checking again (10ms polling)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            } else {
+                // Error (shouldn't happen)
+                break;
+            }
+        }
+        current_child_pid.store(0);
         
         // Check if the process crashed (terminated by signal)
         crashed = IsCrashStatus(status);
@@ -419,7 +455,14 @@ void FuzzerThread::InitializationRun() {
     std::uniform_real_distribution<double> percent_dis(0.10, 0.60);  // 10% to 60%
     
     // Keep running until we have at least 2 executions in knowledge
+    // Check external stop flag (declared in main.cc)
+    extern std::atomic<bool> g_should_stop_fuzzing;
     while (true) {
+        // Check stop flag first - if we're being shut down, exit immediately
+        if (g_should_stop_fuzzing.load()) {
+            break;
+        }
+        
         // Count executions in history (runtime invariant: all entries have non-empty traces/inputs)
         // Thread-safe: read directly with lock
         u32 execution_count = 0;
@@ -498,11 +541,21 @@ void FuzzerThread::InitializationRun() {
             }
         }
         
+        // Check stop flag before executing (ExecOnce can block)
+        if (g_should_stop_fuzzing.load()) {
+            break;
+        }
+        
         // Execute input
         auto exec_result = ExecOnce(input);
         FuzzExecution execution = exec_result.first;
         bool crashed = exec_result.second.first;
         int signal_number = exec_result.second.second;
+        
+        // Check stop flag after executing (in case we need to exit quickly)
+        if (g_should_stop_fuzzing.load()) {
+            break;
+        }
         
         // If crashed, serialize crash information
         if (crashed) {
@@ -535,23 +588,17 @@ void FuzzerThread::InitializationRun() {
             auto tm = *std::localtime(&now);
             crash_filename << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".crash";
             
-            try {
-                SerializeCrash(crash_info, crash_filename.str());
-                // Update global crash stats
-                extern std::atomic<u32> g_crash_count;
-                g_crash_count++;
-            } catch (const std::exception& e) {
-                // Log error but don't stop fuzzing
-                // In a real implementation, you'd want proper logging
-            }
+            SerializeCrash(crash_info, crash_filename.str());
+            // Update global crash stats
+            extern std::atomic<u32> g_crash_count;
+            g_crash_count++;
         }
         
         // Add execution to knowledge only if trace is non-empty
         // (AddExecutionIfDifferent enforces non-empty trace/input invariant)
         // Skip empty traces (e.g., from very early crashes before any basic blocks executed)
-        bool was_added = false;
         if (!execution.trace.empty()) {
-            was_added = knowledge.AddExecutionIfDifferent(execution);
+            knowledge.AddExecutionIfDifferent(execution);
         }
         // Update global execution counter even if we skip empty traces
         extern std::atomic<u32> g_total_executions;
@@ -603,13 +650,14 @@ void FuzzerThread::Run() {
     // Resize input to thread-specific size if needed
     // Each thread uses a different input size based on its thread_id
     if (current_input.size() != thread_input_size) {
+        u32 original_size = current_input.size();
         current_input.resize(thread_input_size);
         // Fill with random bytes if we're expanding
-        if (current_input.size() > latest_exec.input.size()) {
+        if (current_input.size() > original_size) {
             std::random_device rd;
             std::mt19937 gen(rd());
             std::uniform_int_distribution<u8> byte_dis(0, 255);
-            for (u32 i = latest_exec.input.size(); i < current_input.size(); ++i) {
+            for (u32 i = original_size; i < current_input.size(); ++i) {
                 current_input[i] = byte_dis(gen);
             }
         }
@@ -806,15 +854,10 @@ void FuzzerThread::Run() {
             auto tm = *std::localtime(&now);
             crash_filename << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".crash";
             
-            try {
-                SerializeCrash(crash_info, crash_filename.str());
-                // Update global crash stats
-                extern std::atomic<u32> g_crash_count;
-                g_crash_count++;
-            } catch (const std::exception& e) {
-                // Log error but don't stop fuzzing
-                // In a real implementation, you'd want proper logging
-            }
+            SerializeCrash(crash_info, crash_filename.str());
+            // Update global crash stats
+            extern std::atomic<u32> g_crash_count;
+            g_crash_count++;
         }
         
         // Check stop flag before continuing

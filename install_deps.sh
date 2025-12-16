@@ -41,7 +41,7 @@ wget https://github.com/gansm/finalcut/archive/refs/tags/0.9.1.tar.gz && \
   ./autogen.sh && \
   mkdir -pv install && \
   ./configure --prefix=$DEPSDIR/finalcut/install && \
-  make && make install && \
+  make -j$(nproc) && make install && \
   cd $ROOTDIR
 
 echo "Installing CLI11 for command line support"

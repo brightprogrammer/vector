@@ -1,0 +1,7 @@
+libncurses-dev
+g++-14
+automake
+autoconf
+autoconf-archive
+meson>=1.1
+ninja-build

@@ -17,7 +17,7 @@
 class FuzzerTUI : public finalcut::FDialog {
 public:
     explicit FuzzerTUI(finalcut::FWidget* parent, FuzzerKnowledge& knowledge, const Settings& settings);
-    ~FuzzerTUI() override = default;
+    ~FuzzerTUI() override;
     
     // Update the display with latest data
     void RefreshDisplay();

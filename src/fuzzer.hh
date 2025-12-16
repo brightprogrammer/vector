@@ -7,6 +7,8 @@
 #include "shared_trace.h"
 #include <vector>
 #include <string>
+#include <atomic>
+#include <sys/types.h>
 
 ///
 /// Represents the Jacobian matrix retrieved after computation of gradient
@@ -42,6 +44,9 @@ struct FuzzerThread {
     // Counter for consecutive executions with all exploration_speed >= 1.0
     // When this reaches 1000, we restart from a new historical input
     u32 stuck_execution_count{0};
+    
+    // Current child process PID (for killing when stopping)
+    std::atomic<pid_t> current_child_pid{0};
     
     // Constructor: attaches to shared memory for this thread
     FuzzerThread(FuzzerKnowledge& k, u32 tid);

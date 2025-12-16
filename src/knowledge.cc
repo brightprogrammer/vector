@@ -62,13 +62,9 @@ bool FuzzerKnowledge::AddExecutionIfDifferent(const FuzzExecution& execution) {
     graph.UpdateEmbeddings();
 
     // Automatically serialize knowledge to checkpoint file if filepath is set
+    // Checkpoint serialization is best-effort - if it fails, we continue
     if (!checkpoint_filepath.empty()) {
-        try {
-            SerializeKnowledge(*this, checkpoint_filepath);
-        } catch (...) {
-            // If serialization fails, don't fail the add operation
-            // Just continue - checkpoint is best-effort
-        }
+        SerializeKnowledge(*this, checkpoint_filepath);
     }
     
     // Notify that a new execution was added (for main.cc to print summary)
@@ -338,38 +334,36 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
                                 "-endian)");
     }
     
-    // Read Settings
-    Settings settings(0, nullptr); // We'll reconstruct it
-    in.read(reinterpret_cast<char*>(&settings.input_size.min), sizeof(u32));
+    // Read Settings directly into knowledge.settings
+    // Note: knowledge.settings is already initialized by FuzzerKnowledge constructor,
+    // but we overwrite it with deserialized values
+    in.read(reinterpret_cast<char*>(&knowledge.settings.input_size.min), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read input_size.min");
     }
-    in.read(reinterpret_cast<char*>(&settings.input_size.max), sizeof(u32));
+    in.read(reinterpret_cast<char*>(&knowledge.settings.input_size.max), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read input_size.max");
     }
-    in.read(reinterpret_cast<char*>(&settings.input_size.step), sizeof(u32));
+    in.read(reinterpret_cast<char*>(&knowledge.settings.input_size.step), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read input_size.step");
     }
-    in.read(reinterpret_cast<char*>(&settings.thread_count), sizeof(u32));
+    in.read(reinterpret_cast<char*>(&knowledge.settings.thread_count), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read thread_count");
     }
-    in.read(reinterpret_cast<char*>(&settings.max_history_count), sizeof(u32));
+    in.read(reinterpret_cast<char*>(&knowledge.settings.max_history_count), sizeof(u32));
     if (in.fail()) {
         throw std::runtime_error("DeserializeKnowledge: failed to read max_history_count");
     }
-    settings.target_program = ReadString(in);
-    settings.tracer_lib = ReadString(in);
-    settings.drrun_path = ReadString(in);
-    settings.work_dir = ReadString(in);
-    
-    // Update knowledge settings first
-    knowledge.settings = settings;
+    knowledge.settings.target_program = ReadString(in);
+    knowledge.settings.tracer_lib = ReadString(in);
+    knowledge.settings.drrun_path = ReadString(in);
+    knowledge.settings.work_dir = ReadString(in);
     
     // Resize history to match deserialized max_history_count
-    knowledge.history.resize(settings.max_history_count);
+    knowledge.history.resize(knowledge.settings.max_history_count);
     
     // Read history_index
     u32 read_history_index;
@@ -379,7 +373,7 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
     }
     
     // Validate history_index is within bounds
-    if (read_history_index >= settings.max_history_count) {
+    if (read_history_index >= knowledge.settings.max_history_count) {
         throw std::runtime_error("DeserializeKnowledge: history_index out of bounds (possible corruption)");
     }
     knowledge.history_index = read_history_index;
@@ -392,7 +386,7 @@ void DeserializeKnowledge(const std::string& filepath, FuzzerKnowledge& knowledg
     }
     
     // Validate history_size matches max_history_count (circular buffer should be full size)
-    if (history_size != settings.max_history_count) {
+    if (history_size != knowledge.settings.max_history_count) {
         throw std::runtime_error("DeserializeKnowledge: history size mismatch (possible corruption)");
     }
     
