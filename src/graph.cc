@@ -22,9 +22,10 @@ void ExploredGraph::UpdateGraphFromTrace(const ExecTrace& trace) {
         
         // Initialize embedding for new nodes
         if (!embeddings.count(node)) {
-            // Initialize embedding randomly
+            // Initialize embedding with small random values (Xavier/Glorot-like initialization)
+            // Small random values help with gradient stability and convergence
             Embedding emb(embedding_dim);
-            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            std::uniform_real_distribution<double> dist(-0.1, 0.1);
             for (u32 j = 0; j < embedding_dim; ++j) {
                 emb[j] = dist(rng);
             }
@@ -167,10 +168,44 @@ double ExploredGraph::GetTransitionProbability(u32 prev_node, u32 curr_node, u32
 }
 
 // Train embeddings using Skip-gram on a walk
+// Uses negative sampling: for each positive (context) sample, samples negative nodes
 void ExploredGraph::TrainSkipGram(const std::vector<u32>& walk) {
     if (walk.size() < 2) {
         return;
     }
+    
+    // Collect all nodes in walk to exclude from negative sampling
+    // This ensures negative samples are truly negative (not in the walk at all)
+    std::unordered_set<u32> walk_nodes(walk.begin(), walk.end());
+    
+    // Collect all available nodes for negative sampling (excluding walk nodes)
+    std::vector<u32> candidate_negative_nodes;
+    candidate_negative_nodes.reserve(embeddings.size());
+    std::vector<u32> all_nodes_fallback;
+    all_nodes_fallback.reserve(embeddings.size());
+    
+    for (const auto& emb_entry : embeddings) {
+        u32 node = emb_entry.first;
+        all_nodes_fallback.push_back(node);
+        // Only include nodes that are NOT in the current walk
+        if (walk_nodes.find(node) == walk_nodes.end()) {
+            candidate_negative_nodes.push_back(node);
+        }
+    }
+    
+    // Use candidate_negative_nodes if available, otherwise fallback to all_nodes_fallback
+    // This can happen early in training when graph is small
+    const std::vector<u32>* negative_candidates = candidate_negative_nodes.empty() 
+        ? &all_nodes_fallback 
+        : &candidate_negative_nodes;
+    
+    if (negative_candidates->empty()) {
+        return;
+    }
+    
+    // Number of negative samples per positive sample (standard: 5)
+    const u32 num_negative_samples = 5;
+    std::uniform_int_distribution<u32> neg_dist(0, negative_candidates->size() - 1);
     
     // For each node in the walk, predict its context (neighbors within window)
     for (size_t i = 0; i < walk.size(); ++i) {
@@ -195,6 +230,7 @@ void ExploredGraph::TrainSkipGram(const std::vector<u32>& walk) {
             
             Embedding& context_emb = embeddings[context];
             
+            // === POSITIVE SAMPLE ===
             // Compute dot product (similarity)
             double dot_product = 0.0;
             for (u32 d = 0; d < embedding_dim; ++d) {
@@ -204,16 +240,63 @@ void ExploredGraph::TrainSkipGram(const std::vector<u32>& walk) {
             // Sigmoid activation
             double sigmoid = 1.0 / (1.0 + std::exp(-dot_product));
             
-            // Gradient for positive sample (context node)
-            double gradient = (1.0 - sigmoid) * learning_rate;
+            // Gradient for positive sample: maximize P(context|center)
+            // Loss = -log(sigmoid(dot_product))
+            // dLoss/dcenter = -(1 - sigmoid) * context_emb
+            // dLoss/dcontext = -(1 - sigmoid) * center_emb
+            // Update: param += learning_rate * (1 - sigmoid) * other_emb (gradient ascent on log-likelihood)
+            double pos_gradient = (1.0 - sigmoid) * learning_rate;
             
-            // Update embeddings using gradient
+            // Update embeddings for positive sample
             for (u32 d = 0; d < embedding_dim; ++d) {
-                double center_grad = gradient * context_emb[d];
-                double context_grad = gradient * center_emb[d];
+                double center_grad = pos_gradient * context_emb[d];
+                double context_grad = pos_gradient * center_emb[d];
                 
                 center_emb[d] += center_grad;
                 context_emb[d] += context_grad;
+            }
+            
+            // === NEGATIVE SAMPLES ===
+            // Sample negative nodes (not in walk) and minimize their similarity
+            for (u32 neg = 0; neg < num_negative_samples; ++neg) {
+                // Sample a random node from negative candidates (excludes walk nodes)
+                u32 negative_node = (*negative_candidates)[neg_dist(rng)];
+                
+                // Skip if it's the center or context node (safety check)
+                if (negative_node == center || negative_node == context) {
+                    continue;
+                }
+                
+                if (!embeddings.count(negative_node)) {
+                    continue;
+                }
+                
+                Embedding& negative_emb = embeddings[negative_node];
+                
+                // Compute dot product with negative sample
+                double neg_dot_product = 0.0;
+                for (u32 d = 0; d < embedding_dim; ++d) {
+                    neg_dot_product += center_emb[d] * negative_emb[d];
+                }
+                
+                // Sigmoid activation
+                double neg_sigmoid = 1.0 / (1.0 + std::exp(-neg_dot_product));
+                
+                // Gradient for negative sample: minimize P(negative|center)
+                // Loss = -log(1 - sigmoid(dot_product)) = -log(sigmoid(-dot_product))
+                // dLoss/dcenter = sigmoid * negative_emb
+                // dLoss/dnegative = sigmoid * center_emb
+                // Update: param -= learning_rate * sigmoid * other_emb (gradient descent)
+                double neg_gradient = -neg_sigmoid * learning_rate;
+                
+                // Update embeddings for negative sample
+                for (u32 d = 0; d < embedding_dim; ++d) {
+                    double center_grad = neg_gradient * negative_emb[d];
+                    double negative_grad = neg_gradient * center_emb[d];
+                    
+                    center_emb[d] += center_grad;
+                    negative_emb[d] += negative_grad;
+                }
             }
         }
     }
@@ -227,22 +310,30 @@ Embedding ExploredGraph::MeanEmbedding(const ExecTrace& trace) const {
         throw std::logic_error("MeanEmbedding: trace cannot be empty");
     }
     
+    std::lock_guard<std::mutex> lock(graph_mutex);
+    
     Embedding result(embedding_dim, 0.0);
+    u32 node_count = 0;
 
-    // Sum embeddings of all nodes in the trace
+    // Sum embeddings of all nodes in the trace that have embeddings
     for (u32 node : trace) {
         if (embeddings.count(node)) {
             const auto& emb = embeddings.at(node);
             for (u32 i = 0; i < embedding_dim; ++i) {
                 result[i] += emb[i];
             }
+            node_count++;
         }
     }
 
-    // Compute mean
-    for (u32 i = 0; i < embedding_dim; ++i) {
-        result[i] /= trace.size();
+    // Compute mean - only divide by nodes that actually have embeddings
+    // If no nodes have embeddings, return zero embedding
+    if (node_count > 0) {
+        for (u32 i = 0; i < embedding_dim; ++i) {
+            result[i] /= node_count;
+        }
     }
+    // Otherwise result is already zero-initialized
     
     return result;
 }

@@ -67,4 +67,10 @@ if ! $CC -O0 -g -o$BUILDDIR/testprograms/vulnerable \
     echo "ERROR: Failed to build test programs" >&2
     exit 1
 fi
+if ! $CC -O0 -g -o$BUILDDIR/testprograms/explosion \
+    $ROOTDIR/testprograms/explosion.c \
+    -Wall -Wextra; then
+    echo "ERROR: Failed to build test programs" >&2
+    exit 1
+fi
 echo "building test programs... DONE"

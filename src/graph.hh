@@ -42,9 +42,9 @@ struct ExploredGraph {
     double learning_rate;                                   // learning rate for SGD
 
     // Constructor with Node2Vec parameters
-    ExploredGraph(u32 dim = 4, u32 seed = 42,
+    ExploredGraph(u32 dim = 3, u32 seed = __COUNTER__,
                   double p_param = 1.0, double q_param = 1.0,
-                  u32 walk_len = 10, u32 walks = 5,
+                  u32 walk_len = 25, u32 walks = 10,
                   u32 window = 3, double lr = 0.025)
         : embedding_dim(dim), rng(seed),
           p(p_param), q(q_param), walk_length(walk_len),
