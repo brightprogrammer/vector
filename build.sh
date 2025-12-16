@@ -39,16 +39,11 @@ if ! $CXX -std=c++14 \
   $SRCDIR/crash.cc \
   $SRCDIR/loss.cc \
   $SRCDIR/graph.cc \
-  $SRCDIR/tui.cc \
   $SRCDIR/seed.cc \
   $SRCDIR/shared_trace.c \
   -o$BUILDDIR/main \
   -I$SRCDIR \
   -I$DEPSDIR/CLI11 \
-  -I$DEPSDIR/finalcut/install/include \
-  -L$DEPSDIR/finalcut/install/lib \
-  -Wl,-rpath,$DEPSDIR/finalcut/install/lib \
-  -lfinal \
   -lpthread \
   -Wall -Werror; then
     echo "ERROR: Failed to build fuzzer" >&2

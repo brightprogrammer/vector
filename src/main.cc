@@ -13,7 +13,6 @@
 #include "settings.hh"
 #include "knowledge.hh"
 #include "fuzzer.hh"
-#include "tui.hh"
 #include "seed.hh"
 
 // stdc++
@@ -30,7 +29,6 @@
 #include <memory>
 #include <mutex>
 #include <fstream>
-#include <final/final.h>
 
 // Global flag to stop fuzzing threads
 std::atomic<bool> g_should_stop_fuzzing{false};
@@ -40,6 +38,50 @@ std::atomic<u32> g_total_executions{0};
 
 // Global crash counter (accessed from fuzzer.cc)
 std::atomic<u32> g_crash_count{0};
+
+// Print fuzzer knowledge statistics (read-only access)
+void PrintKnowledgeStats(const FuzzerKnowledge& knowledge) {
+    // Use thread-safe const methods - no locking needed in main thread
+    std::vector<FuzzExecution> history = knowledge.GetHistorySnapshot();
+    u32 history_index = knowledge.GetHistoryIndex();
+    u32 total_executions = g_total_executions.load();
+    u32 total_crashes = g_crash_count.load();
+    
+    // Count non-empty executions in history
+    u32 history_count = 0;
+    for (const auto& exec : history) {
+        if (!exec.trace.empty()) {
+            history_count++;
+        }
+    }
+    
+    // Get graph stats (read-only access - graph_mutex is mutable so const methods can lock)
+    // We access through const reference, but need to lock for thread safety
+    u32 graph_nodes = 0;
+    u32 graph_embeddings = 0;
+    {
+        std::lock_guard<std::mutex> lock(knowledge.graph.graph_mutex);
+        graph_nodes = knowledge.graph.graph.size();
+        graph_embeddings = knowledge.graph.embeddings.size();
+    }
+    
+    // Clear screen and print stats
+    std::cout << "\033[2J\033[H";  // ANSI clear screen and move cursor to top
+    std::cout << "=== Vector Fuzzer Statistics ===" << std::endl;
+    std::cout << "Total Executions: " << total_executions << std::endl;
+    std::cout << "Total Crashes: " << total_crashes << std::endl;
+    std::cout << "History Size: " << history_count << " / " << knowledge.settings.max_history_count << std::endl;
+    std::cout << "History Index: " << history_index << std::endl;
+    std::cout << "Graph Nodes: " << graph_nodes << std::endl;
+    std::cout << "Graph Embeddings: " << graph_embeddings << std::endl;
+    std::cout << "Embedding Dimension: " << knowledge.graph.embedding_dim << std::endl;
+    std::cout << "Target Program: " << knowledge.settings.target_program << std::endl;
+    std::cout << "Work Directory: " << knowledge.settings.work_dir << std::endl;
+    std::cout << "Thread Count: " << knowledge.settings.thread_count << std::endl;
+    std::cout << std::endl;
+    std::cout << "Press Ctrl+C to stop..." << std::endl;
+    std::cout.flush();
+}
 
 int main(int argc, char* argv[])
 {
@@ -85,135 +127,119 @@ int main(int argc, char* argv[])
         u32 seeds_loaded = LoadSeedsFromDirectory(settings.seed_path, knowledge, settings);
         std::cout << "[*] Loaded " << seeds_loaded << " seed inputs into history" << std::endl;
     }
-        
-        // Reset stop flag
-        g_should_stop_fuzzing = false;
-        
-        // Set up signal handler for graceful shutdown
-        std::signal(SIGINT, [](int) {
-            g_should_stop_fuzzing = true;
+    
+    // Reset stop flag
+    g_should_stop_fuzzing = false;
+    
+    // Set up signal handler for graceful shutdown
+    std::signal(SIGINT, [](int) {
+        g_should_stop_fuzzing = true;
+    });
+    std::signal(SIGTERM, [](int) {
+        g_should_stop_fuzzing = true;
+    });
+    
+    // Spawn fuzzer threads
+    // Store fuzzer instances so we can kill their child processes
+    std::vector<std::thread> fuzzer_threads;
+    std::vector<FuzzerThread*> fuzzer_instances(settings.thread_count, nullptr);
+    
+    for (u32 i = 0; i < settings.thread_count; ++i) {
+        fuzzer_threads.emplace_back([&knowledge, i, &fuzzer_instances]() {
+            FuzzerThread fuzzer(knowledge, i);
+            fuzzer_instances[i] = &fuzzer;
+            
+            // Run initialization
+            fuzzer.InitializationRun();
+            
+            // Main fuzzing loop - Run() checks g_should_stop_fuzzing
+            fuzzer.Run();
+            
+            fuzzer_instances[i] = nullptr;
         });
-        std::signal(SIGTERM, [](int) {
-            g_should_stop_fuzzing = true;
-        });
-        
-        // Initialize finalcut application
-        finalcut::FApplication app{argc, argv};
-        
-        // Create TUI window - reads directly from knowledge when timer fires
-        // Use a separate scope to ensure TUI is destroyed before app
-        {
-            FuzzerTUI tui_window{&app, knowledge, settings};
-            tui_window.show();
-            
-            // Spawn fuzzer threads
-            // Store fuzzer instances so we can kill their child processes
-            std::vector<std::thread> fuzzer_threads;
-            std::vector<FuzzerThread*> fuzzer_instances(settings.thread_count, nullptr);
-            
-            for (u32 i = 0; i < settings.thread_count; ++i) {
-                fuzzer_threads.emplace_back([&knowledge, i, &fuzzer_instances]() {
-                    FuzzerThread fuzzer(knowledge, i);
-                    fuzzer_instances[i] = &fuzzer;
-                    
-                    // Run initialization
-                    fuzzer.InitializationRun();
-                    
-                    // Main fuzzing loop - Run() checks g_should_stop_fuzzing
-                    fuzzer.Run();
-                    
-                    fuzzer_instances[i] = nullptr;
-                });
+    }
+    
+    // Main thread: print knowledge stats every 2 seconds
+    // Main thread has constant read-only access to fuzzer knowledge
+    while (!g_should_stop_fuzzing.load()) {
+        PrintKnowledgeStats(knowledge);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    
+    // Signal threads to stop
+    g_should_stop_fuzzing = true;
+    
+    // Immediately kill all child processes that threads might be waiting on
+    // This allows threads to exit waitpid() quickly
+    for (FuzzerThread* fuzzer : fuzzer_instances) {
+        if (fuzzer) {
+            pid_t child_pid = fuzzer->current_child_pid.load();
+            if (child_pid > 0) {
+                kill(child_pid, SIGKILL);
+                waitpid(child_pid, NULL, 0);  // Clean up zombie
             }
-            
-            // Run finalcut event loop in main thread
-            // TUI timer will call RefreshDisplay() which reads directly from knowledge
-            app.exec();
-            
-            // Signal threads to stop
-            g_should_stop_fuzzing = true;
-            
-            // Immediately kill all child processes that threads might be waiting on
-            // This allows threads to exit waitpid() quickly
-            for (FuzzerThread* fuzzer : fuzzer_instances) {
-                if (fuzzer) {
-                    pid_t child_pid = fuzzer->current_child_pid.load();
-                    if (child_pid > 0) {
-                        kill(child_pid, SIGKILL);
-                        waitpid(child_pid, NULL, 0);  // Clean up zombie
-                    }
-                }
-            }
-            
-            // Forcefully terminate threads immediately (Linux only)
-            // On Linux, we can use pthread_cancel to forcefully stop threads
-            // This interrupts blocking calls and causes threads to exit
-            for (size_t i = 0; i < fuzzer_threads.size(); ++i) {
-                auto& t = fuzzer_threads[i];
-                if (t.joinable()) {
+        }
+    }
+    
+    // Forcefully terminate threads immediately (Linux only)
+    // On Linux, we can use pthread_cancel to forcefully stop threads
+    // This interrupts blocking calls and causes threads to exit
+    for (size_t i = 0; i < fuzzer_threads.size(); ++i) {
+        auto& t = fuzzer_threads[i];
+        if (t.joinable()) {
 #ifdef __linux__
-                    // Cancel the thread forcefully - this will interrupt blocking calls
-                    pthread_t native = t.native_handle();
-                    pthread_cancel(native);
+            // Cancel the thread forcefully - this will interrupt blocking calls
+            pthread_t native = t.native_handle();
+            pthread_cancel(native);
 #endif
-                }
-            }
-            
-            // Now join all threads (they should exit quickly after cancellation)
-            for (auto& t : fuzzer_threads) {
-                if (t.joinable()) {
-                    t.join();
-                }
-            }
-            
-            // Clear thread vector (threads are already joined)
-            fuzzer_threads.clear();
-            
-            // Note: TUI is already closed (when Escape was pressed, close() was called)
-            // and app.exec() has returned, so we don't need to close/quit again
-            
-            // Cleanup knowledge BEFORE destroying TUI to avoid issues
-            // CRITICAL: We must ensure NO threads are holding mutex locks when we delete knowledge
-            // Mutex destructors will throw if the mutex is locked, causing std::terminate()
-            if (knowledge_ptr) {
-                // Try to acquire both mutexes to ensure they're not locked
-                // This will block if a thread still has them, but threads should have exited by now
-                // Use try_lock to avoid blocking forever if something is wrong
-                bool knowledge_locked = false;
-                bool graph_locked = false;
-                
-                // Try to lock knowledge mutex (non-blocking)
-                knowledge_locked = knowledge_ptr->knowledge_mutex.try_lock();
-                if (knowledge_locked) {
-                    knowledge_ptr->knowledge_mutex.unlock();
-                }
-                
-                // Try to lock graph mutex (non-blocking)
-                graph_locked = knowledge_ptr->graph.graph_mutex.try_lock();
-                if (graph_locked) {
-                    knowledge_ptr->graph.graph_mutex.unlock();
-                }
-                
-                // Verify both mutexes are unlocked before deletion
-                // If either is still locked, threads haven't finished (shouldn't happen after join)
-                // Mutex destructors will throw if locked, causing std::terminate()
-                if (!knowledge_locked || !graph_locked) {
-                    std::cerr << "[!] Warning: Mutexes still locked after threads joined. "
-                              << "This should not happen. Proceeding anyway..." << std::endl;
-                }
-                
-                // Delete knowledge - mutexes should be unlocked
-                // If they're still locked, the destructor will throw
-                delete knowledge_ptr;
-                knowledge_ptr = nullptr;
-            }
-            
-            // TUI will be destroyed here when it goes out of scope
-            // It's already been closed, so the destructor should be safe
+        }
+    }
+    
+    // Now join all threads (they should exit quickly after cancellation)
+    for (auto& t : fuzzer_threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    
+    // Clear thread vector (threads are already joined)
+    fuzzer_threads.clear();
+    
+    // Cleanup knowledge BEFORE destroying to avoid issues
+    // CRITICAL: We must ensure NO threads are holding mutex locks when we delete knowledge
+    // Mutex destructors will throw if the mutex is locked, causing std::terminate()
+    if (knowledge_ptr) {
+        // Try to acquire both mutexes to ensure they're not locked
+        // This will block if a thread still has them, but threads should have exited by now
+        // Use try_lock to avoid blocking forever if something is wrong
+        bool knowledge_locked = false;
+        bool graph_locked = false;
+        
+        // Try to lock knowledge mutex (non-blocking)
+        knowledge_locked = knowledge_ptr->knowledge_mutex.try_lock();
+        if (knowledge_locked) {
+            knowledge_ptr->knowledge_mutex.unlock();
         }
         
-        // App will be destroyed here when it goes out of scope
-        // All cleanup is complete, so destructors should run safely
+        // Try to lock graph mutex (non-blocking)
+        graph_locked = knowledge_ptr->graph.graph_mutex.try_lock();
+        if (graph_locked) {
+            knowledge_ptr->graph.graph_mutex.unlock();
+        }
         
-        return 0;
+        // Verify both mutexes are unlocked before deletion
+        // If either is still locked, threads haven't finished (shouldn't happen after join)
+        // Mutex destructors will throw if locked, causing std::terminate()
+        if (!knowledge_locked || !graph_locked) {
+            std::cerr << "[!] Warning: Mutexes still locked after threads joined. "
+                      << "This should not happen. Proceeding anyway..." << std::endl;
+        }
+        
+        // Delete knowledge - mutexes should be unlocked
+        // If they're still locked, the destructor will throw
+        delete knowledge_ptr;
+        knowledge_ptr = nullptr;
+    }
+    
+    return 0;
 }

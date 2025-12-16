@@ -6,7 +6,7 @@
 #include <cstdint>
 
 FuzzerKnowledge::FuzzerKnowledge(const Settings& s)
-    : history_index(0), settings(s), graph(4, 42, 1.0, 1.0, 10, 5, 3, 0.025), checkpoint_filepath() {
+    : history_index(0), settings(s), graph(), checkpoint_filepath() {
     // Initialize circular buffer with max_history_count capacity
     // Graph uses default Node2Vec parameters (can be made configurable later)
     history.resize(settings.max_history_count);
